@@ -21,7 +21,6 @@ def carregar_numeros_bloqueados():
         if not os.path.exists(EXCEL_FILE):
             return []
         df_bloq = pd.read_excel(EXCEL_FILE, sheet_name="TelefoneContatos_Bloqueados")
-        # Converte a coluna de telefones para string para garantir comparação exata
         return [str(num).strip() for num in df_bloq["Telefone"].dropna().tolist()]
     except Exception as e:
         print(f"Erro ao carregar números bloqueados: {e}")
@@ -30,34 +29,45 @@ def carregar_numeros_bloqueados():
 
 def consultar_excel(pergunta):
     """
-    Consulta o Excel de forma inteligente, lidando com saudações, menu principal e FAQ.
+    Consulta o Excel de forma inteligente, lidando com menus, opções numéricas e FAQs.
     """
     try:
         if not os.path.exists(EXCEL_FILE):
             return "⚠️ Erro: Ficheiro de diretório académico não encontrado no servidor."
 
-        pergunta_lower = pergunta.strip().lower()
+        pergunta_limpa = pergunta.strip().lower()
 
-        # 1. Se for saudação, apresenta o Menu Principal
-        saudacoes = ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "menu", "ajuda"]
-        if pergunta_lower in saudacoes:
+        # 1. Palavras de saudação, menu ou encerramento que retornam ao Menu Principal
+        comandos_menu = ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "menu", "ajuda", "0", "encerrar",
+                         "sair", "encerrar atendimento"]
+        if pergunta_limpa in comandos_menu:
             df_menu = pd.read_excel(EXCEL_FILE, sheet_name="Menu_Principal")
-            menu_texto = "👋 Olá! Bem-vinda(o) ao atendimento académico da Sofia. Escolha uma das opções abaixo digitando o número ou o assunto:\n\n"
+            menu_texto = "👋 Atendimento encerrado/reiniciado com sucesso!\n\nBem-vinda(o) ao atendimento académico da Sofia. Escolha uma das opções abaixo digitando o número ou o assunto:\n\n"
             for _, row in df_menu.iterrows():
-                menu_texto += f"• **{row['Numero']}** - {row['Opcao']}\n"
+                menu_texto += f"• *{row['Numero']}* - {row['Opcao']}\n"
             return menu_texto
 
-        # 2. Procura nas FAQs (aba 'FAQ_BaseNumero_Menu')
+        # 2. Se o utilizador enviou diretamente um número de opção (ex: "1", "2", "3", "4")
         df_faq = pd.read_excel(EXCEL_FILE, sheet_name="FAQ_BaseNumero_Menu")
 
+        if pergunta_limpa.isdigit():
+            num_opcao = float(pergunta_limpa)
+            filtrado = df_faq[df_faq['Numero_Menu'] == num_opcao]
+            if not filtrado.empty:
+                resposta_acumulada = f"📌 *Opção {pergunta_limpa} — Conteúdos Disponíveis:*\n\n"
+                for _, row in filtrado.iterrows():
+                    proc = row.get('Processo ', '')
+                    resp = row.get('Instrucoes_Tecnicas', '')
+                    resposta_acumulada += f"🔹 *{proc}*\n{resp}\n\n-------------------\n\n"
+                return resposta_acumulada
+
+        # 3. Procura textual por palavras-chave nas FAQs
         for _, row in df_faq.iterrows():
             categoria = str(row.get("Categoria ", "")).lower()
             processo = str(row.get("Processo ", "")).lower()
             palavras_chave = str(row.get("Palavras_Chave", "")).lower()
 
-            # Verifica se alguma palavra-chave, processo ou categoria corresponde à pergunta
-            if (pergunta_lower in palavras_chave) or (pergunta_lower in processo) or (pergunta_lower in categoria) or (
-                    pergunta_lower in str(row.get("Numero_Menu", ""))):
+            if (pergunta_limpa in palavras_chave) or (pergunta_limpa in processo) or (pergunta_limpa in categoria):
                 cat_nome = row.get("Categoria ", "Informação")
                 proc_nome = row.get("Processo ", "")
                 instrucoes = row.get("Instrucoes_Tecnicas", "Consulte os detalhes no portal académico.")
@@ -116,7 +126,7 @@ def webhook():
 
             numero_limpo = remote_jid.split("@")[0]
 
-            # --- 2. LÓGICA DE NÚMEROS BLOQUEADOS (Dinamicos do Excel) ---
+            # --- 2. LÓGICA DE NÚMEROS BLOQUEADOS ---
             numeros_bloqueados = carregar_numeros_bloqueados()
             if numero_limpo in numeros_bloqueados:
                 print(f"Mensagem bloqueada do número: {numero_limpo}")
@@ -128,7 +138,6 @@ def webhook():
                 "text", "")
 
             if texto_mensagem and numero_limpo:
-                # Consulta o Excel e envia a resposta
                 resposta_bot = consultar_excel(texto_mensagem)
                 enviar_mensagem_whatsapp(numero_limpo, resposta_bot)
 
