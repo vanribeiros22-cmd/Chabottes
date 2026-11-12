@@ -12,34 +12,58 @@ API_KEY = "cetrus2026teste"
 
 EXCEL_FILE = "diretorio_academico.xlsx"
 
-# Lista de números bloqueados (pode ser carregada do Excel ou mantida aqui)
-# Exemplo: números no formato internacional sem símbolos
-NUMEROS_BLOQUEADOS = ["55119970345241", "5511915026540"]
 
-
-def verificar_bloqueio(numero):
+def carregar_numeros_bloqueados():
     """
-    Verifica se o número do remetente consta na lista de bloqueados.
+    Carrega a lista de números bloqueados diretamente da aba 'TelefoneContatos_Bloqueados' do Excel.
     """
-    return numero in NUMEROS_BLOQUEADOS
+    try:
+        if not os.path.exists(EXCEL_FILE):
+            return []
+        df_bloq = pd.read_excel(EXCEL_FILE, sheet_name="TelefoneContatos_Bloqueados")
+        # Converte a coluna de telefones para string para garantir comparação exata
+        return [str(num).strip() for num in df_bloq["Telefone"].dropna().tolist()]
+    except Exception as e:
+        print(f"Erro ao carregar números bloqueados: {e}")
+        return []
 
 
 def consultar_excel(pergunta):
     """
-    Consulta o ficheiro Excel do diretório académico com base na pergunta do utilizador.
+    Consulta o Excel de forma inteligente, lidando com saudações, menu principal e FAQ.
     """
     try:
         if not os.path.exists(EXCEL_FILE):
             return "⚠️ Erro: Ficheiro de diretório académico não encontrado no servidor."
 
-        df = pd.read_excel(EXCEL_FILE)
-        pergunta_lower = pergunta.lower()
+        pergunta_lower = pergunta.strip().lower()
 
-        for index, row in df.iterrows():
-            if any(str(val).lower() in pergunta_lower for val in row.values):
-                return f"encontrei esta informação:\n" + "\n".join([f"- {col}: {row[col]}" for col in df.columns])
+        # 1. Se for saudação, apresenta o Menu Principal
+        saudacoes = ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "menu", "ajuda"]
+        if pergunta_lower in saudacoes:
+            df_menu = pd.read_excel(EXCEL_FILE, sheet_name="Menu_Principal")
+            menu_texto = "👋 Olá! Bem-vinda(o) ao atendimento académico da Sofia. Escolha uma das opções abaixo digitando o número ou o assunto:\n\n"
+            for _, row in df_menu.iterrows():
+                menu_texto += f"• **{row['Numero']}** - {row['Opcao']}\n"
+            return menu_texto
 
-        return "Desculpa, não encontrei nenhuma informação correspondente no diretório académico. Podes tentar reformular a pergunta?"
+        # 2. Procura nas FAQs (aba 'FAQ_BaseNumero_Menu')
+        df_faq = pd.read_excel(EXCEL_FILE, sheet_name="FAQ_BaseNumero_Menu")
+
+        for _, row in df_faq.iterrows():
+            categoria = str(row.get("Categoria ", "")).lower()
+            processo = str(row.get("Processo ", "")).lower()
+            palavras_chave = str(row.get("Palavras_Chave", "")).lower()
+
+            # Verifica se alguma palavra-chave, processo ou categoria corresponde à pergunta
+            if (pergunta_lower in palavras_chave) or (pergunta_lower in processo) or (pergunta_lower in categoria) or (
+                    pergunta_lower in str(row.get("Numero_Menu", ""))):
+                cat_nome = row.get("Categoria ", "Informação")
+                proc_nome = row.get("Processo ", "")
+                instrucoes = row.get("Instrucoes_Tecnicas", "Consulte os detalhes no portal académico.")
+                return f"📌 *{cat_nome} — {proc_nome}*\n\n{instrucoes}"
+
+        return "Desculpa, não encontrei nenhuma informação correspondente no diretório académico. Podes enviar 'menu' para ver as opções disponíveis ou reformular a pergunta?"
 
     except Exception as e:
         return f"Ocorreu um erro ao processar os dados académicos: {str(e)}"
@@ -86,17 +110,15 @@ def webhook():
                 return jsonify({"status": "ignored"}), 200
 
             # --- 1. LÓGICA DE GRUPOS ---
-            # Se o remoteJid terminar com '@g.us', é uma mensagem de grupo.
-            # Decidimos ignorar mensagens de grupo para que a Sofia responda apenas no privado.
             if remote_jid.endswith("@g.us"):
                 print(f"Mensagem de grupo ignorada: {remote_jid}")
                 return jsonify({"status": "group_ignored"}), 200
 
-            # Extrai o número limpo do remetente privado
             numero_limpo = remote_jid.split("@")[0]
 
-            # --- 2. LÓGICA DE NÚMEROS BLOQUEADOS ---
-            if verificar_bloqueio(numero_limpo):
+            # --- 2. LÓGICA DE NÚMEROS BLOQUEADOS (Dinamicos do Excel) ---
+            numeros_bloqueados = carregar_numeros_bloqueados()
+            if numero_limpo in numeros_bloqueados:
                 print(f"Mensagem bloqueada do número: {numero_limpo}")
                 return jsonify({"status": "blocked_number"}), 200
 
