@@ -29,7 +29,7 @@ def carregar_numeros_bloqueados():
 
 def consultar_excel(pergunta):
     """
-    Consulta o Excel tratando o Menu Principal e a listagem interativa de Submenus.
+    Consulta o Excel tratando o Menu Principal, submenus e FAQs com robustez.
     """
     try:
         if not os.path.exists(EXCEL_FILE):
@@ -44,34 +44,35 @@ def consultar_excel(pergunta):
             df_menu = pd.read_excel(EXCEL_FILE, sheet_name="Menu_Principal")
             menu_texto = "👋 Atendimento reiniciado!\n\nBem-vinda(o) ao atendimento académico da Sofia. Escolha uma das opções abaixo digitando o número:\n\n"
             for _, row in df_menu.iterrows():
-                menu_texto += f"• *{row['Numero']}* - {row['Opcao']}\n"
+                menu_texto += f"• *{int(row['Numero'])}* - {row['Opcao']}\n"
             return menu_texto
 
         df_faq = pd.read_excel(EXCEL_FILE, sheet_name="FAQ_BaseNumero_Menu")
 
-        # 2. Se o utilizador enviou um número principal (ex: "1", "2", "3", "4", "5", "6")
+        # 2. Se o utilizador enviou um número principal (ex: "1", "2", "3", etc.)
         if pergunta_limpa.isdigit() and len(pergunta_limpa) == 1:
             num_opcao = float(pergunta_limpa)
             filtrado = df_faq[df_faq['Numero_Menu'] == num_opcao]
 
             if not filtrado.empty:
                 cat_nome = filtrado.iloc[0].get('Categoria ', 'Atendimento')
-                sub_texto = f"📌 *{cat_nome} — Submenus Disponíveis:*\n\nEscolha o assunto digitando o número correspondente:\n\n"
+                sub_texto = f"📌 *{cat_nome} — Submenus Disponíveis:*\n\nEscolha o assunto digitando o número correspondente (ex: {int(num_opcao)}.1):\n\n"
 
                 for _, row in filtrado.iterrows():
-                    sub_num = row.get('Numero_Submenu', '')
+                    sub_num = int(row.get('Numero_Submenu', 1))
                     proc = row.get('Processo ', '')
-                    sub_texto += f"• *{num_opcao}.{int(sub_num)}* — {proc}\n"
+                    sub_texto += f"• *{int(num_opcao)}.{sub_num}* — {proc}\n"
 
                 sub_texto += "\n*(Ou envie 'menu' para voltar ao início)*"
                 return sub_texto
 
-        # 3. Se o utilizador enviou um submenu composto (ex: "2.1", "1.3", etc.)
+        # 3. Se o utilizador enviou um submenu composto (ex: "1.1", "1.0.1", "2.2", etc.)
         if "." in pergunta_limpa:
             try:
                 partes = pergunta_limpa.split(".")
                 menu_num = float(partes[0])
-                sub_num = float(partes[1])
+                # Pega na última parte como o número do submenu para suportar "1.0.1" ou "1.1"
+                sub_num = float(partes[-1])
 
                 encontrado = df_faq[(df_faq['Numero_Menu'] == menu_num) & (df_faq['Numero_Submenu'] == sub_num)]
                 if not encontrado.empty:
@@ -80,8 +81,8 @@ def consultar_excel(pergunta):
                     proc = row.get('Processo ', '')
                     resp = row.get('Instrucoes_Tecnicas', 'Consulte os detalhes no portal.')
                     return f"📌 *{cat} — {proc}*\n\n{resp}"
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Erro ao processar submenu: {e}")
 
         # 4. Procura textual por palavras-chave
         for _, row in df_faq.iterrows():
