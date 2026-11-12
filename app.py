@@ -29,7 +29,7 @@ def carregar_numeros_bloqueados():
 
 def consultar_excel(pergunta):
     """
-    Consulta o Excel de forma inteligente, lidando com menus, opções numéricas e FAQs.
+    Consulta o Excel tratando o Menu Principal e a listagem interativa de Submenus.
     """
     try:
         if not os.path.exists(EXCEL_FILE):
@@ -37,31 +37,53 @@ def consultar_excel(pergunta):
 
         pergunta_limpa = pergunta.strip().lower()
 
-        # 1. Palavras de saudação, menu ou encerramento que retornam ao Menu Principal
+        # 1. Comandos de reinício ou menu principal
         comandos_menu = ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "menu", "ajuda", "0", "encerrar",
                          "sair", "encerrar atendimento"]
         if pergunta_limpa in comandos_menu:
             df_menu = pd.read_excel(EXCEL_FILE, sheet_name="Menu_Principal")
-            menu_texto = "👋 Atendimento encerrado/reiniciado com sucesso!\n\nBem-vinda(o) ao atendimento académico da Sofia. Escolha uma das opções abaixo digitando o número ou o assunto:\n\n"
+            menu_texto = "👋 Atendimento reiniciado!\n\nBem-vinda(o) ao atendimento académico da Sofia. Escolha uma das opções abaixo digitando o número:\n\n"
             for _, row in df_menu.iterrows():
                 menu_texto += f"• *{row['Numero']}* - {row['Opcao']}\n"
             return menu_texto
 
-        # 2. Se o utilizador enviou diretamente um número de opção (ex: "1", "2", "3", "4")
         df_faq = pd.read_excel(EXCEL_FILE, sheet_name="FAQ_BaseNumero_Menu")
 
-        if pergunta_limpa.isdigit():
+        # 2. Se o utilizador enviou um número principal (ex: "1", "2", "3", "4", "5", "6")
+        if pergunta_limpa.isdigit() and len(pergunta_limpa) == 1:
             num_opcao = float(pergunta_limpa)
             filtrado = df_faq[df_faq['Numero_Menu'] == num_opcao]
-            if not filtrado.empty:
-                resposta_acumulada = f"📌 *Opção {pergunta_limpa} — Conteúdos Disponíveis:*\n\n"
-                for _, row in filtrado.iterrows():
-                    proc = row.get('Processo ', '')
-                    resp = row.get('Instrucoes_Tecnicas', '')
-                    resposta_acumulada += f"🔹 *{proc}*\n{resp}\n\n-------------------\n\n"
-                return resposta_acumulada
 
-        # 3. Procura textual por palavras-chave nas FAQs
+            if not filtrado.empty:
+                cat_nome = filtrado.iloc[0].get('Categoria ', 'Atendimento')
+                sub_texto = f"📌 *{cat_nome} — Submenus Disponíveis:*\n\nEscolha o assunto digitando o número correspondente:\n\n"
+
+                for _, row in filtrado.iterrows():
+                    sub_num = row.get('Numero_Submenu', '')
+                    proc = row.get('Processo ', '')
+                    sub_texto += f"• *{num_opcao}.{int(sub_num)}* — {proc}\n"
+
+                sub_texto += "\n*(Ou envie 'menu' para voltar ao início)*"
+                return sub_texto
+
+        # 3. Se o utilizador enviou um submenu composto (ex: "2.1", "1.3", etc.)
+        if "." in pergunta_limpa:
+            try:
+                partes = pergunta_limpa.split(".")
+                menu_num = float(partes[0])
+                sub_num = float(partes[1])
+
+                encontrado = df_faq[(df_faq['Numero_Menu'] == menu_num) & (df_faq['Numero_Submenu'] == sub_num)]
+                if not encontrado.empty:
+                    row = encontrado.iloc[0]
+                    cat = row.get('Categoria ', '')
+                    proc = row.get('Processo ', '')
+                    resp = row.get('Instrucoes_Tecnicas', 'Consulte os detalhes no portal.')
+                    return f"📌 *{cat} — {proc}*\n\n{resp}"
+            except Exception:
+                pass
+
+        # 4. Procura textual por palavras-chave
         for _, row in df_faq.iterrows():
             categoria = str(row.get("Categoria ", "")).lower()
             processo = str(row.get("Processo ", "")).lower()
@@ -73,7 +95,7 @@ def consultar_excel(pergunta):
                 instrucoes = row.get("Instrucoes_Tecnicas", "Consulte os detalhes no portal académico.")
                 return f"📌 *{cat_nome} — {proc_nome}*\n\n{instrucoes}"
 
-        return "Desculpa, não encontrei nenhuma informação correspondente no diretório académico. Podes enviar 'menu' para ver as opções disponíveis ou reformular a pergunta?"
+        return "Desculpa, não encontrei nenhuma informação correspondente. Podes enviar 'menu' para ver as opções disponíveis ou reformular a pergunta?"
 
     except Exception as e:
         return f"Ocorreu um erro ao processar os dados académicos: {str(e)}"
@@ -114,25 +136,18 @@ def webhook():
             message_data = dados.get("data", {})
             remote_jid = message_data.get("key", {}).get("remoteJid", "")
 
-            # Ignora mensagens enviadas pelo próprio bot
-            from_me = message_data.get("key", {}).get("fromMe", False)
-            if from_me:
+            if message_data.get("key", {}).get("fromMe", False):
                 return jsonify({"status": "ignored"}), 200
 
-            # --- 1. LÓGICA DE GRUPOS ---
             if remote_jid.endswith("@g.us"):
-                print(f"Mensagem de grupo ignorada: {remote_jid}")
                 return jsonify({"status": "group_ignored"}), 200
 
             numero_limpo = remote_jid.split("@")[0]
 
-            # --- 2. LÓGICA DE NÚMEROS BLOQUEADOS ---
             numeros_bloqueados = carregar_numeros_bloqueados()
             if numero_limpo in numeros_bloqueados:
-                print(f"Mensagem bloqueada do número: {numero_limpo}")
                 return jsonify({"status": "blocked_number"}), 200
 
-            # Extrai o conteúdo da mensagem
             message_content = message_data.get("message", {})
             texto_mensagem = message_content.get("conversation") or message_content.get("extendedTextMessage", {}).get(
                 "text", "")
