@@ -27,9 +27,27 @@ def carregar_numeros_bloqueados():
         return []
 
 
+def formatar_resposta(row):
+    """
+    Formata o texto da resposta incluindo o link do arquivo caso exista na planilha.
+    """
+    cat = row.get('Categoria ', '')
+    proc = row.get('Processo ', '')
+    resp = row.get('Instrucoes_Tecnicas', 'Consulte os detalhes no portal.')
+    link_arquivo = row.get('Link_Arquivo', '')
+
+    texto_final = f"📌 *{cat} — {proc}*\n\n{resp}"
+
+    # Se houver um link de arquivo (PDF/Imagem/Drive) preenchido, adiciona à mensagem
+    if pd.notna(link_arquivo) and str(link_arquivo).strip() != "":
+        texto_final += f"\n\n📂 *Material / Documento Associado:*\n{str(link_arquivo).strip()}"
+
+    return texto_final
+
+
 def consultar_excel(pergunta):
     """
-    Consulta o Excel tratando o Menu Principal, submenus e FAQs com robustez.
+    Consulta o Excel tratando menus, submenus únicos e FAQs de forma inteligente.
     """
     try:
         if not os.path.exists(EXCEL_FILE):
@@ -49,12 +67,18 @@ def consultar_excel(pergunta):
 
         df_faq = pd.read_excel(EXCEL_FILE, sheet_name="FAQ_BaseNumero_Menu")
 
-        # 2. Se o utilizador enviou um número principal (ex: "1", "2", "3", etc.)
+        # 2. Se o utilizador enviou um número principal (ex: "1", "2", "5", etc.)
         if pergunta_limpa.isdigit() and len(pergunta_limpa) == 1:
             num_opcao = float(pergunta_limpa)
             filtrado = df_faq[df_faq['Numero_Menu'] == num_opcao]
 
             if not filtrado.empty:
+                # Se a categoria tiver apenas 1 submenu (ex: Opção 5), envia a resposta diretamente!
+                if len(filtrado) == 1:
+                    row_unica = filtrado.iloc[0]
+                    return formatar_resposta(row_unica)
+
+                # Caso contrário, lista os submenus disponíveis
                 cat_nome = filtrado.iloc[0].get('Categoria ', 'Atendimento')
                 sub_texto = f"📌 *{cat_nome} — Submenus Disponíveis:*\n\nEscolha o assunto digitando o número correspondente (ex: {int(num_opcao)}.1):\n\n"
 
@@ -66,21 +90,17 @@ def consultar_excel(pergunta):
                 sub_texto += "\n*(Ou envie 'menu' para voltar ao início)*"
                 return sub_texto
 
-        # 3. Se o utilizador enviou um submenu composto (ex: "1.1", "1.0.1", "2.2", etc.)
+        # 3. Se o utilizador enviou um submenu composto (ex: "5.1", "6.4", etc.)
         if "." in pergunta_limpa:
             try:
                 partes = pergunta_limpa.split(".")
                 menu_num = float(partes[0])
-                # Pega na última parte como o número do submenu para suportar "1.0.1" ou "1.1"
                 sub_num = float(partes[-1])
 
                 encontrado = df_faq[(df_faq['Numero_Menu'] == menu_num) & (df_faq['Numero_Submenu'] == sub_num)]
                 if not encontrado.empty:
                     row = encontrado.iloc[0]
-                    cat = row.get('Categoria ', '')
-                    proc = row.get('Processo ', '')
-                    resp = row.get('Instrucoes_Tecnicas', 'Consulte os detalhes no portal.')
-                    return f"📌 *{cat} — {proc}*\n\n{resp}"
+                    return formatar_resposta(row)
             except Exception as e:
                 print(f"Erro ao processar submenu: {e}")
 
@@ -91,10 +111,7 @@ def consultar_excel(pergunta):
             palavras_chave = str(row.get("Palavras_Chave", "")).lower()
 
             if (pergunta_limpa in palavras_chave) or (pergunta_limpa in processo) or (pergunta_limpa in categoria):
-                cat_nome = row.get("Categoria ", "Informação")
-                proc_nome = row.get("Processo ", "")
-                instrucoes = row.get("Instrucoes_Tecnicas", "Consulte os detalhes no portal académico.")
-                return f"📌 *{cat_nome} — {proc_nome}*\n\n{instrucoes}"
+                return formatar_resposta(row)
 
         return "Desculpa, não encontrei nenhuma informação correspondente. Podes enviar 'menu' para ver as opções disponíveis ou reformular a pergunta?"
 
