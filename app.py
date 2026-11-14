@@ -47,7 +47,7 @@ def formatar_resposta(row):
 
 def consultar_excel(pergunta):
     """
-    Consulta o Excel tratando menus, submenus únicos e FAQs de forma inteligente.
+    Consulta o Excel tratando o encerramento global (em qualquer submenu), menus e FAQs.
     """
     try:
         if not os.path.exists(EXCEL_FILE):
@@ -55,32 +55,36 @@ def consultar_excel(pergunta):
 
         pergunta_limpa = pergunta.strip().lower()
 
-        # 1. Comandos de reinício ou menu principal
-        comandos_menu = ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "menu", "ajuda", "0", "encerrar",
-                         "sair", "encerrar atendimento"]
+        # 1. COMANDO DE ENCERRAMENTO GLOBAL (Funciona no menu principal e em QUALQUER submenu)
+        comandos_saida = ["0", "encerrar", "sair", "encerrar atendimento"]
+        if pergunta_limpa in comandos_saida:
+            return "Atendimento encerrado. Obrigado pelo contato! 💙\n\nSe precisar de algo, é só enviar uma nova mensagem a qualquer momento."
+
+        # 2. Comandos de Saudação ou Abertura de Menu
+        comandos_menu = ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "menu", "ajuda"]
         if pergunta_limpa in comandos_menu:
             df_menu = pd.read_excel(EXCEL_FILE, sheet_name="Menu_Principal")
-            menu_texto = "👋 Atendimento reiniciado!\n\nBem-vinda(o) ao atendimento académico da Sofia. Escolha uma das opções abaixo digitando o número:\n\n"
+            menu_texto = "👋 Bem-vinda(o) ao atendimento académico da Sofia. Escolha uma das opções abaixo digitando o número:\n\n"
             for _, row in df_menu.iterrows():
                 menu_texto += f"• *{int(row['Numero'])}* - {row['Opcao']}\n"
             return menu_texto
 
         df_faq = pd.read_excel(EXCEL_FILE, sheet_name="FAQ_BaseNumero_Menu")
 
-        # 2. Se o utilizador enviou um número principal (ex: "1", "2", "5", etc.)
+        # 3. Se o utilizador enviou um número principal (ex: "1", "2", "5", etc.)
         if pergunta_limpa.isdigit() and len(pergunta_limpa) == 1:
             num_opcao = float(pergunta_limpa)
             filtrado = df_faq[df_faq['Numero_Menu'] == num_opcao]
 
             if not filtrado.empty:
-                # Se a categoria tiver apenas 1 submenu (ex: Opção 5), envia a resposta diretamente!
+                # Se a categoria tiver apenas 1 submenu (ex: Opção 5 - Atendimento Humano), envia a resposta diretamente
                 if len(filtrado) == 1:
                     row_unica = filtrado.iloc[0]
                     return formatar_resposta(row_unica)
 
                 # Caso contrário, lista os submenus disponíveis
                 cat_nome = filtrado.iloc[0].get('Categoria ', 'Atendimento')
-                sub_texto = f"📌 *{cat_nome} — Submenus Disponíveis:*\n\nEscolha o assunto digitando o número correspondente (ex: {int(num_opcao)}.1):\n\n"
+                sub_texto = f"📌 *{cat_nome} — Submenus Disponíveis:*\n\nEscolha o assunto digitando o número correspondente (ex: {int(num_opcao)}.1) ou envie *0* para encerrar:\n\n"
 
                 for _, row in filtrado.iterrows():
                     sub_num = int(row.get('Numero_Submenu', 1))
@@ -90,7 +94,7 @@ def consultar_excel(pergunta):
                 sub_texto += "\n*(Ou envie 'menu' para voltar ao início)*"
                 return sub_texto
 
-        # 3. Se o utilizador enviou um submenu composto (ex: "5.1", "6.4", etc.)
+        # 4. Se o utilizador enviou um submenu composto (ex: "5.1", "6.4", etc.)
         if "." in pergunta_limpa:
             try:
                 partes = pergunta_limpa.split(".")
@@ -104,7 +108,7 @@ def consultar_excel(pergunta):
             except Exception as e:
                 print(f"Erro ao processar submenu: {e}")
 
-        # 4. Procura textual por palavras-chave
+        # 5. Procura textual por palavras-chave
         for _, row in df_faq.iterrows():
             categoria = str(row.get("Categoria ", "")).lower()
             processo = str(row.get("Processo ", "")).lower()
