@@ -47,7 +47,7 @@ def formatar_resposta(row):
 
 def consultar_excel(pergunta):
     """
-    Consulta o Excel tratando o encerramento global (em qualquer submenu), menus e FAQs.
+    Consulta o Excel tratando o encerramento global, menus principais e submenus com instrução de saída.
     """
     try:
         if not os.path.exists(EXCEL_FILE):
@@ -55,16 +55,16 @@ def consultar_excel(pergunta):
 
         pergunta_limpa = pergunta.strip().lower()
 
-        # 1. COMANDO DE ENCERRAMENTO GLOBAL (Funciona no menu principal e em QUALQUER submenu)
+        # 1. COMANDO DE ENCERRAMENTO GLOBAL (Funciona em qualquer submenu ou início)
         comandos_saida = ["0", "encerrar", "sair", "encerrar atendimento"]
         if pergunta_limpa in comandos_saida:
             return "Atendimento encerrado. Obrigado pelo contato! 💙\n\nSe precisar de algo, é só enviar uma nova mensagem a qualquer momento."
 
-        # 2. Comandos de Saudação ou Abertura de Menu
+        # 2. Comandos de Saudação ou Abertura de Menu (Inclui instrução de encerramento)
         comandos_menu = ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "menu", "ajuda"]
         if pergunta_limpa in comandos_menu:
             df_menu = pd.read_excel(EXCEL_FILE, sheet_name="Menu_Principal")
-            menu_texto = "👋 Bem-vinda(o) ao atendimento académico da Sofia. Escolha uma das opções abaixo digitando o número:\n\n"
+            menu_texto = "👋 Bem-vinda(o) ao atendimento académico da Sofia. Escolha uma das opções abaixo digitando o número (ou envie *0* para encerrar):\n\n"
             for _, row in df_menu.iterrows():
                 menu_texto += f"• *{int(row['Numero'])}* - {row['Opcao']}\n"
             return menu_texto
@@ -82,7 +82,7 @@ def consultar_excel(pergunta):
                     row_unica = filtrado.iloc[0]
                     return formatar_resposta(row_unica)
 
-                # Caso contrário, lista os submenus disponíveis
+                # Caso contrário, lista os submenus disponíveis com o aviso de encerramento
                 cat_nome = filtrado.iloc[0].get('Categoria ', 'Atendimento')
                 sub_texto = f"📌 *{cat_nome} — Submenus Disponíveis:*\n\nEscolha o assunto digitando o número correspondente (ex: {int(num_opcao)}.1) ou envie *0* para encerrar:\n\n"
 
@@ -94,7 +94,7 @@ def consultar_excel(pergunta):
                 sub_texto += "\n*(Ou envie 'menu' para voltar ao início)*"
                 return sub_texto
 
-        # 4. Se o utilizador enviou um submenu composto (ex: "5.1", "6.4", etc.)
+        # 4. Se o utilizador enviou um submenu composto (ex: "1.1", "6.4", etc.)
         if "." in pergunta_limpa:
             try:
                 partes = pergunta_limpa.split(".")
