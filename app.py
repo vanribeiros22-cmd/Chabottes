@@ -14,6 +14,9 @@ API_KEY = "cetrus2026teste"
 
 EXCEL_FILE = "diretorio_academico.xlsx"
 
+# Memória temporária que guarda os números que estão em atendimento humano (bot pausado)
+atendimentos_humanos_ativos = set()
+
 
 # ==============================================================================
 # 2. FUNÇÕES AUXILIARES (BLOQUEIO E FORMATAÇÃO)
@@ -60,12 +63,11 @@ def formatar_resposta(row):
 
 
 # ==============================================================================
-# 3. MOTOR DE CONSULTA AO EXCEL (MENUS, SUBMENUS E ENCERRAMENTO)
+# 3. MOTOR DE CONSULTA AO EXCEL (MENUS, SUBMENUS, PAUSA E ENCERRAMENTO)
 # ==============================================================================
-def consultar_excel(pergunta):
+def consultar_excel(pergunta, numero_aluno):
     """
-    Processa a mensagem recebida do aluno e decide qual resposta enviar:
-    encerramento, menu principal, lista de submenus ou resposta específica.
+    Processa a mensagem recebida do aluno e decide qual resposta enviar.
     """
     try:
         if not os.path.exists(EXCEL_FILE):
@@ -74,8 +76,10 @@ def consultar_excel(pergunta):
         pergunta_limpa = pergunta.strip().lower()
 
         # --- PASSO A: COMANDO DE ENCERRAMENTO GLOBAL ---
-        comandos_saida = ["0", "encerrar", "sair", "encerrar atendimento"]
+        comandos_saida = ["0", "encerrar", "sair", "encerrar atendimento", "#finalizar"]
         if pergunta_limpa in comandos_saida:
+            # Garante que o aluno sai do modo de atendimento humano caso estivesse nele
+            atendimentos_humanos_ativos.discard(numero_aluno)
             return (
                 "Atendimento encerrado. Obrigado pelo contato! 💙\n\n"
                 "Se precisar de algo, é só enviar uma nova mensagem a qualquer momento."
@@ -98,10 +102,25 @@ def consultar_excel(pergunta):
         # --- PASSO C: ESCOLHA DE UMA OPÇÃO DO MENU PRINCIPAL (1 a 6) ---
         if pergunta_limpa.isdigit() and len(pergunta_limpa) == 1:
             num_opcao = float(pergunta_limpa)
+
+            # Se for a opção 5 (Atendimento Humano), ativa a pausa do bot para este número!
+            if num_opcao == 5.0:
+                atendimentos_humanos_ativos.add(numero_aluno)
+                filtrado_5 = df_faq[df_faq['Numero_Menu'] == 5.0]
+                msg_humano = "👩‍💻 *Transferindo para o Atendimento Humano...*\n\n"
+                if not filtrado_5.empty:
+                    msg_humano += str(filtrado_5.iloc[0].get('Instrucoes_Tecnicas',
+                                                             'Aguarde um momento, um de nossos atendentes já vai falar com você.'))
+                else:
+                    msg_humano += "Aguarde um momento, um de nossos atendentes já vai falar com você."
+
+                msg_humano += "\n\n_(O robô ficará pausado durante este atendimento)_"
+                return msg_humano
+
             filtrado = df_faq[df_faq['Numero_Menu'] == num_opcao]
 
             if not filtrado.empty:
-                # Se a opção tiver apenas 1 item (ex: Opção 5 - Atendimento Humano), envia direto
+                # Se a opção tiver apenas 1 item, envia direto
                 if len(filtrado) == 1:
                     return formatar_resposta(filtrado.iloc[0])
 
@@ -131,6 +150,10 @@ def consultar_excel(pergunta):
                 partes = pergunta_limpa.split(".")
                 menu_num = float(partes[0])
                 sub_num = float(partes[-1])
+
+                # Se o aluno digitar 5.1 diretamente, também ativa o atendimento humano
+                if menu_num == 5.0:
+                    atendimentos_humanos_ativos.add(numero_aluno)
 
                 encontrado = df_faq[(df_faq['Numero_Menu'] == menu_num) & (df_faq['Numero_Submenu'] == sub_num)]
                 if not encontrado.empty:
@@ -195,21 +218,13 @@ def webhook():
         if evento == "messages.upsert":
             message_data = dados.get("data", {})
             remote_jid = message_data.get("key", {}).get("remoteJid", "")
-
-            # Ignora mensagens enviadas pelo próprio bot
-            if message_data.get("key", {}).get("fromMe", False):
-                return jsonify({"status": "ignored"}), 200
+            from_me = message_data.get("key", {}).get("fromMe", False)
 
             # Ignora mensagens de grupos (@g.us)
             if remote_jid.endswith("@g.us"):
                 return jsonify({"status": "group_ignored"}), 200
 
             numero_limpo = remote_jid.split("@")[0]
-
-            # Ignora contatos presentes na aba de bloqueados do Excel
-            numeros_bloqueados = carregar_numeros_bloqueados()
-            if numero_limpo in numeros_bloqueados:
-                return jsonify({"status": "blocked_number"}), 200
 
             # Extrai o texto da mensagem
             message_content = message_data.get("message", {})
@@ -218,8 +233,37 @@ def webhook():
                     or message_content.get("extendedTextMessage", {}).get("text", "")
             )
 
+            # --- VERIFICAÇÃO DO ATENDENTE HUMANO (MENSAGEM ENVIADA PELO PRÓPRIO NÚMERO) ---
+            if from_me:
+                # Se o atendente enviar "#finalizar" na conversa do aluno, reativa o robô!
+                if texto_mensagem and "#finalizar" in texto_mensagem.lower():
+                    atendimentos_humanos_ativos.discard(numero_limpo)
+                    enviar_mensagem_whatsapp(
+                        numero_limpo,
+                        "Atendimento humano finalizado. Obrigado pelo contato! 💙\n\nSe precisar de algo novamente, basta enviar *oi* ou *menu*."
+                    )
+                return jsonify({"status": "from_me_processed"}), 200
+
+            # Ignora contatos presentes na aba de bloqueados do Excel
+            numeros_bloqueados = carregar_numeros_bloqueados()
+            if numero_limpo in numeros_bloqueados:
+                return jsonify({"status": "blocked_number"}), 200
+
+            # --- VERIFICAÇÃO DE PAUSA (SE ESTIVER COM HUMANO, O ROBÔ FICA EM SILÊNCIO) ---
+            if numero_limpo in atendimentos_humanos_ativos:
+                # Permite apenas que o próprio aluno encerre caso envie "0" ou "#finalizar"
+                if texto_mensagem.strip().lower() in ["0", "#finalizar"]:
+                    atendimentos_humanos_ativos.discard(numero_limpo)
+                    enviar_mensagem_whatsapp(
+                        numero_limpo,
+                        "Atendimento encerrado. Obrigado pelo contato! 💙\n\nSe precisar de algo, é só enviar uma nova mensagem a qualquer momento."
+                    )
+                else:
+                    print(f"Bot pausado para {numero_limpo} (em atendimento humano).")
+                return jsonify({"status": "paused_for_human"}), 200
+
             if texto_mensagem and numero_limpo:
-                resposta_bot = consultar_excel(texto_mensagem)
+                resposta_bot = consultar_excel(texto_mensagem, numero_limpo)
                 enviar_mensagem_whatsapp(numero_limpo, resposta_bot)
 
     except Exception as e:
