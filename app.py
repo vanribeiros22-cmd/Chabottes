@@ -7,10 +7,10 @@ from datetime import datetime, timedelta, timezone
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. CONFIGURAÇÕES DA EVOLUTION API E DO ARQUIVO DE DADOS
+# 1. CONFIGURAÇÕES DA EVOLUTION API E DO ARQUIVO DE DADOS (PRODUÇÃO)
 # ==============================================================================
 EVOLUTION_API_URL = "https://evolution-api-production-db931012.up.railway.app"
-INSTANCE_NAME = "sofia-bot"
+INSTANCE_NAME = "sofia-oficial"  # <-- Atualizado para a nova instância oficial
 API_KEY = "cetrus2026teste"
 
 EXCEL_FILE = "diretorio_academico.xlsx"
