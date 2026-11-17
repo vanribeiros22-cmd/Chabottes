@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, render_template_string
 import pandas as pd
 import requests
 import os
@@ -10,7 +10,7 @@ app = Flask(__name__)
 # 1. CONFIGURAÇÕES DA EVOLUTION API E DO ARQUIVO DE DADOS (PRODUÇÃO)
 # ==============================================================================
 EVOLUTION_API_URL = "https://evolution-api-production-db931012.up.railway.app"
-INSTANCE_NAME = "sofia-oficial"  # <-- Atualizado para a nova instância oficial
+INSTANCE_NAME = "sofia-oficial"
 API_KEY = "cetrus2026teste"
 
 EXCEL_FILE = "diretorio_academico.xlsx"
@@ -28,9 +28,23 @@ def normalizar_telefone(numero):
     Padroniza o número de telefone (DDD + últimos 8 dígitos) para evitar
     falhas entre o número recebido e o enviado com/sem o 9º dígito.
     """
-    apenas_digitos = "".join(filter(str.isdigit, str(numero)))
+    if not numero:
+        return ""
+    numero_str = str(numero).split("@")[0]
+    apenas_digitos = "".join(filter(str.isdigit, numero_str))
     if len(apenas_digitos) >= 10:
         return apenas_digitos[-10:]
+    return apenas_digitos
+
+
+def formatar_para_envio(numero):
+    """
+    Garante que o número tenha o código do Brasil (55) para envio ativo
+    quando o usuário digita apenas DDD + Número (ex: 11999998888).
+    """
+    apenas_digitos = "".join(filter(str.isdigit, str(numero)))
+    if len(apenas_digitos) in [10, 11]:
+        return "55" + apenas_digitos
     return apenas_digitos
 
 
@@ -59,7 +73,6 @@ def gerenciar_estado_humano(numero_norm, acao="verificar"):
     if not numero_norm:
         return False
 
-    # Verifica primeiro na memória rápida
     if acao == "verificar" and numero_norm in pausa_memoria:
         return True
 
@@ -160,6 +173,18 @@ def registrar_metrica(numero_aluno, categoria, processo, duvida, desfecho, resol
         print(f"[ERRO] Falha ao registrar métrica: {e}")
 
 
+def gerar_texto_menu_principal():
+    """Gera o texto formatado do menu principal a partir do Excel."""
+    df_menu = pd.read_excel(EXCEL_FILE, sheet_name="Menu_Principal")
+    menu_texto = (
+        "👋 Bem-vinda(o) ao atendimento acadêmico da Sofia!\n\n"
+        "Escolha uma das opções abaixo digitando apenas o *número* correspondente:\n\n"
+    )
+    for _, row in df_menu.iterrows():
+        menu_texto += f"• *{int(row['Numero'])}* - {row['Opcao']}\n"
+    return menu_texto
+
+
 def formatar_resposta(row):
     """Monta a mensagem final da resposta com título, instruções e rodapé."""
     cat = row.get('Categoria ', '')
@@ -206,16 +231,9 @@ def consultar_excel(pergunta, numero_aluno_norm):
         # --- PASSO B: SAUDAÇÃO OU MENU PRINCIPAL ---
         comandos_menu = ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "menu", "ajuda"]
         if pergunta_limpa in comandos_menu:
-            df_menu = pd.read_excel(EXCEL_FILE, sheet_name="Menu_Principal")
             registrar_metrica(numero_aluno_norm, "Menu Principal", "Início / Boas-vindas", pergunta,
                               "Exibiu Menu Principal", "Sim")
-            menu_texto = (
-                "👋 Bem-vinda(o) ao atendimento acadêmico da Sofia!\n\n"
-                "Escolha uma das opções abaixo digitando apenas o *número* correspondente:\n\n"
-            )
-            for _, row in df_menu.iterrows():
-                menu_texto += f"• *{int(row['Numero'])}* - {row['Opcao']}\n"
-            return menu_texto
+            return gerar_texto_menu_principal()
 
         df_faq = pd.read_excel(EXCEL_FILE, sheet_name="FAQ_BaseNumero_Menu")
 
@@ -311,7 +329,7 @@ def consultar_excel(pergunta, numero_aluno_norm):
 
 
 # ==============================================================================
-# 4. ENVIO DE MENSAGENS, DOWNLOAD DE MÉTRICAS E ROTA DO WEBHOOK
+# 4. ENVIO DE MENSAGENS, DISPARO ATIVO (/iniciar), MÉTRICAS E WEBHOOK
 # ==============================================================================
 def enviar_mensagem_whatsapp(numero_destino, texto_resposta):
     """Envia o texto formatado de volta para o WhatsApp via Evolution API."""
@@ -327,18 +345,102 @@ def enviar_mensagem_whatsapp(numero_destino, texto_resposta):
 
     try:
         response = requests.post(url, json=payload, headers=headers)
+        print(f"[ENVIO API] Status: {response.status_code} | Destino: {numero_destino}")
         return response.json()
     except Exception as e:
         print(f"[ERRO] Falha ao enviar mensagem: {e}")
         return None
 
 
+@app.route("/iniciar", methods=["GET", "POST"])
+def iniciar_contato():
+    """
+    Painel web simples para a equipe iniciar contato ativo com qualquer número,
+    podendo enviar o Menu da Sofia ou uma mensagem humana (pausando o bot).
+    """
+    resultado = ""
+    if request.method == "POST":
+        senha = request.form.get("senha", "")
+        numero = request.form.get("numero", "")
+        modo = request.form.get("modo", "menu")
+        mensagem_custom = request.form.get("mensagem", "")
+
+        if senha != API_KEY:
+            resultado = "❌ Chave de acesso incorreta."
+        elif not numero:
+            resultado = "❌ Por favor, digite o número com DDD."
+        else:
+            num_envio = formatar_para_envio(numero)
+            num_norm = normalizar_telefone(num_envio)
+
+            if modo == "menu":
+                gerenciar_estado_humano(num_norm, acao="desativar")
+                texto_para_enviar = gerar_texto_menu_principal()
+                registrar_metrica(num_norm, "Contato Ativo", "Disparo Menu Sofia", "Início Ativo", "Menu Enviado",
+                                  "Sim")
+            else:
+                gerenciar_estado_humano(num_norm, acao="ativar")
+                texto_para_enviar = mensagem_custom.strip() or "Olá! Tudo bem? Aqui é da equipe acadêmica, como posso ajudar?"
+                registrar_metrica(num_norm, "Contato Ativo", "Disparo Humano", texto_para_enviar,
+                                  "Atendimento Humano Iniciado", "Em andamento")
+
+            resp = enviar_mensagem_whatsapp(num_envio, texto_para_enviar)
+            if resp and ("key" in str(resp) or "PENDING" in str(resp) or "status" in str(resp)):
+                resultado = f"✅ Mensagem enviada com sucesso para {num_envio}!"
+            else:
+                resultado = f"⚠️ Resposta da API: {resp}"
+
+    html = """
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <title>Iniciar Contato - Sofia Oficial</title>
+        <style>
+            body { font-family: Arial, sans-serif; background: #f4f6f9; padding: 40px; }
+            .card { max-width: 480px; margin: auto; background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            h2 { color: #1e293b; margin-top: 0; }
+            label { display: block; margin-top: 15px; font-weight: bold; color: #334155; }
+            input, select, textarea { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #cbd5e1; border-radius: 6px; box-sizing: border-box; }
+            button { margin-top: 20px; width: 100%; padding: 12px; background: #0f766e; color: white; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; }
+            button:hover { background: #115e59; }
+            .msg { margin-top: 15px; padding: 12px; border-radius: 6px; background: #e2e8f0; font-weight: bold; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h2>📲 Iniciar Contato (Sofia Oficial)</h2>
+            <form method="POST">
+                <label>Senha de Acesso (API Key):</label>
+                <input type="password" name="senha" placeholder="Digite a chave de acesso" required>
+
+                <label>Número do Aluno (com DDD):</label>
+                <input type="text" name="numero" placeholder="Ex: 11988887777" required>
+
+                <label>Como deseja iniciar?</label>
+                <select name="modo">
+                    <option value="menu">1. Enviar Menu Automático da Sofia</option>
+                    <option value="humano">2. Mensagem Manual (Pausar o Robô)</option>
+                </select>
+
+                <label>Mensagem Personalizada (se escolheu opção 2):</label>
+                <textarea name="mensagem" rows="3" placeholder="Olá! Aqui é da secretaria acadêmica..."></textarea>
+
+                <button type="submit">Enviar Mensagem Agora</button>
+            </form>
+            {% if resultado %}
+                <div class="msg">{{ resultado }}</div>
+            {% endif %}
+        </div>
+    </body>
+    </html>
+    """
+    return render_template_string(html, resultado=resultado)
+
+
 @app.route("/metricas", methods=["GET"])
 def baixar_metricas():
-    """
-    Rota para baixar a planilha Excel atualizada com todas as métricas
-    e controle de atendimento registrados até o momento.
-    """
+    """Rota para baixar a planilha Excel atualizada com todas as métricas."""
     if os.path.exists(EXCEL_FILE):
         return send_file(
             EXCEL_FILE,
@@ -350,25 +452,30 @@ def baixar_metricas():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Recebe as notificações de novas mensagens da Evolution API."""
+    """Recebe as notificações de novas mensagens da Evolution API (Business e Padrão)."""
     dados = request.json
 
     try:
-        evento = dados.get("event", "")
+        evento = dados.get("event", "").lower()
 
-        # Escuta tanto mensagens recebidas/enviadas (messages.upsert) quanto envios diretos (send.message)
         if evento in ["messages.upsert", "send.message"]:
-            message_data = dados.get("data", {})
+            raw_data = dados.get("data", {})
+            # Na Evolution v2 / WhatsApp Business, 'data' pode vir como lista ou dicionário
+            message_data = raw_data[0] if isinstance(raw_data, list) and len(raw_data) > 0 else raw_data
+
             key = message_data.get("key", {})
             remote_jid = key.get("remoteJid", "")
+            # WhatsApp Business usa remoteJidAlt quando remoteJid vem mascarado com @lid
+            remote_jid_alt = key.get("remoteJidAlt", "")
 
-            # Se for send.message, significa que foi enviado pelo próprio aparelho da instituição
             from_me = True if evento == "send.message" else key.get("fromMe", False)
 
             if remote_jid.endswith("@g.us"):
                 return jsonify({"status": "group_ignored"}), 200
 
-            numero_bruto = remote_jid.split("@")[0]
+            # Prioriza o JID alternativo se o principal vier como @lid
+            jid_real = remote_jid_alt if ("@lid" in remote_jid and remote_jid_alt) else remote_jid
+            numero_bruto = jid_real.split("@")[0]
             numero_norm = normalizar_telefone(numero_bruto)
 
             message_content = message_data.get("message", {})
@@ -377,24 +484,22 @@ def webhook():
                     or message_content.get("extendedTextMessage", {}).get("text", "")
             )
 
-            print(f"[WEBHOOK] Evento: {evento} | DeMim: {from_me} | Num: {numero_norm} | Texto: {texto_mensagem}")
+            print(
+                f"[WEBHOOK] Evento: {evento} | DeMim: {from_me} | JID: {jid_real} | Norm: {numero_norm} | Texto: {texto_mensagem}")
 
-            if not texto_mensagem:
-                return jsonify({"status": "no_text"}), 200
+            if not texto_mensagem or not numero_norm:
+                return jsonify({"status": "ignored_empty"}), 200
 
             # --- VERIFICAÇÃO DO ATENDENTE HUMANO (MENSAGEM ENVIADA PELO APARELHO DA INSTITUIÇÃO) ---
             if from_me:
-                # 1. Se o atendente enviar "#finalizar", reativa o robô e encerra!
                 if "#finalizar" in texto_mensagem.lower():
                     gerenciar_estado_humano(numero_norm, acao="desativar")
                     registrar_metrica(numero_norm, "Atendimento Humano", "Finalização Atendente", "#finalizar",
                                       "Atendimento Humano Concluído", "Sim")
                     enviar_mensagem_whatsapp(
-                        numero_bruto,
+                        jid_real,
                         "Atendimento humano finalizado. Obrigado pelo contato! 💙\n\nSe precisar de algo novamente, basta enviar *oi* ou *menu*."
                     )
-                # 2. Se o atendente digitar manualmente uma mensagem (que não seja gerada pelo próprio robô),
-                # coloca o chat em pausa automaticamente para o robô não atrapalhar!
                 elif not texto_mensagem.startswith(
                         ("👋", "📌", "👩‍💻", "Desculpe,", "Atendimento encerrado", "Atendimento humano")):
                     gerenciar_estado_humano(numero_norm, acao="ativar")
@@ -403,6 +508,7 @@ def webhook():
             # Ignora contatos presentes na aba de bloqueados
             numeros_bloqueados = carregar_numeros_bloqueados()
             if numero_norm in numeros_bloqueados:
+                print(f"[BLOQUEADO] Ignorando contato da lista negra: {numero_norm}")
                 return jsonify({"status": "blocked_number"}), 200
 
             # --- VERIFICAÇÃO DE PAUSA (SE ESTIVER COM HUMANO, O ROBÔ FICA EM SILÊNCIO) ---
@@ -412,7 +518,7 @@ def webhook():
                     registrar_metrica(numero_norm, "Atendimento Humano", "Encerrado pelo Aluno", texto_mensagem,
                                       "Encerrado pelo Aluno", "Sim")
                     enviar_mensagem_whatsapp(
-                        numero_bruto,
+                        jid_real,
                         "Atendimento encerrado. Obrigado pelo contato! 💙\n\nSe precisar de algo, é só enviar uma nova mensagem a qualquer momento."
                     )
                 else:
@@ -421,7 +527,7 @@ def webhook():
 
             # Processa fluxo normal do bot
             resposta_bot = consultar_excel(texto_mensagem, numero_norm)
-            enviar_mensagem_whatsapp(numero_bruto, resposta_bot)
+            enviar_mensagem_whatsapp(jid_real, resposta_bot)
 
     except Exception as e:
         print(f"[ERRO] Falha crítica no webhook: {e}")
