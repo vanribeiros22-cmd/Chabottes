@@ -5,7 +5,9 @@ import os
 
 app = Flask(__name__)
 
-# Configurações da Evolution API
+# ==============================================================================
+# 1. CONFIGURAÇÕES DA EVOLUTION API E DO ARQUIVO DE DADOS
+# ==============================================================================
 EVOLUTION_API_URL = "https://evolution-api-production-db931012.up.railway.app"
 INSTANCE_NAME = "sofia-bot"
 API_KEY = "cetrus2026teste"
@@ -13,9 +15,13 @@ API_KEY = "cetrus2026teste"
 EXCEL_FILE = "diretorio_academico.xlsx"
 
 
+# ==============================================================================
+# 2. FUNÇÕES AUXILIARES (BLOQUEIO E FORMATAÇÃO)
+# ==============================================================================
 def carregar_numeros_bloqueados():
     """
-    Carrega a lista de números bloqueados diretamente da aba 'TelefoneContatos_Bloqueados' do Excel.
+    Lê a aba 'TelefoneContatos_Bloqueados' do Excel e retorna uma lista
+    com os números que o bot deve ignorar.
     """
     try:
         if not os.path.exists(EXCEL_FILE):
@@ -29,7 +35,8 @@ def carregar_numeros_bloqueados():
 
 def formatar_resposta(row):
     """
-    Formata o texto da resposta incluindo o link do arquivo caso exista na planilha.
+    Monta a mensagem final da resposta com título, instruções, link (se houver)
+    e opções claras de navegação no rodapé.
     """
     cat = row.get('Categoria ', '')
     proc = row.get('Processo ', '')
@@ -38,63 +45,87 @@ def formatar_resposta(row):
 
     texto_final = f"📌 *{cat} — {proc}*\n\n{resp}"
 
-    # Se houver um link de arquivo (PDF/Imagem/Drive) preenchido, adiciona à mensagem
+    # Se existir um link na coluna Link_Arquivo, anexa à mensagem
     if pd.notna(link_arquivo) and str(link_arquivo).strip() != "":
         texto_final += f"\n\n📂 *Material / Documento Associado:*\n{str(link_arquivo).strip()}"
 
+    # Adiciona orientação clara ao final de cada resposta
+    texto_final += (
+        "\n\n-----------------------------------\n"
+        "💡 *Como continuar:*\n"
+        "• Digite *menu* para voltar ao início\n"
+        "• Digite *0* para encerrar o atendimento"
+    )
     return texto_final
 
 
+# ==============================================================================
+# 3. MOTOR DE CONSULTA AO EXCEL (MENUS, SUBMENUS E ENCERRAMENTO)
+# ==============================================================================
 def consultar_excel(pergunta):
     """
-    Consulta o Excel tratando o encerramento global, menus principais e submenus com instrução de saída.
+    Processa a mensagem recebida do aluno e decide qual resposta enviar:
+    encerramento, menu principal, lista de submenus ou resposta específica.
     """
     try:
         if not os.path.exists(EXCEL_FILE):
-            return "⚠️ Erro: Ficheiro de diretório académico não encontrado no servidor."
+            return "⚠️ Erro: Arquivo de diretório acadêmico não encontrado no servidor."
 
         pergunta_limpa = pergunta.strip().lower()
 
-        # 1. COMANDO DE ENCERRAMENTO GLOBAL (Funciona em qualquer submenu ou início)
+        # --- PASSO A: COMANDO DE ENCERRAMENTO GLOBAL ---
         comandos_saida = ["0", "encerrar", "sair", "encerrar atendimento"]
         if pergunta_limpa in comandos_saida:
-            return "Atendimento encerrado. Obrigado pelo contato! 💙\n\nSe precisar de algo, é só enviar uma nova mensagem a qualquer momento."
+            return (
+                "Atendimento encerrado. Obrigado pelo contato! 💙\n\n"
+                "Se precisar de algo, é só enviar uma nova mensagem a qualquer momento."
+            )
 
-        # 2. Comandos de Saudação ou Abertura de Menu (Inclui instrução de encerramento)
+        # --- PASSO B: SAUDAÇÃO OU MENU PRINCIPAL ---
         comandos_menu = ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "menu", "ajuda"]
         if pergunta_limpa in comandos_menu:
             df_menu = pd.read_excel(EXCEL_FILE, sheet_name="Menu_Principal")
-            menu_texto = "👋 Bem-vinda(o) ao atendimento académico da Sofia. Escolha uma das opções abaixo digitando o número (ou envie *0* para encerrar):\n\n"
+            menu_texto = (
+                "👋 Bem-vinda(o) ao atendimento acadêmico da Sofia!\n\n"
+                "Escolha uma das opções abaixo digitando apenas o *número* correspondente:\n\n"
+            )
             for _, row in df_menu.iterrows():
                 menu_texto += f"• *{int(row['Numero'])}* - {row['Opcao']}\n"
             return menu_texto
 
         df_faq = pd.read_excel(EXCEL_FILE, sheet_name="FAQ_BaseNumero_Menu")
 
-        # 3. Se o utilizador enviou um número principal (ex: "1", "2", "5", etc.)
+        # --- PASSO C: ESCOLHA DE UMA OPÇÃO DO MENU PRINCIPAL (1 a 6) ---
         if pergunta_limpa.isdigit() and len(pergunta_limpa) == 1:
             num_opcao = float(pergunta_limpa)
             filtrado = df_faq[df_faq['Numero_Menu'] == num_opcao]
 
             if not filtrado.empty:
-                # Se a categoria tiver apenas 1 submenu (ex: Opção 5 - Atendimento Humano), envia a resposta diretamente
+                # Se a opção tiver apenas 1 item (ex: Opção 5 - Atendimento Humano), envia direto
                 if len(filtrado) == 1:
-                    row_unica = filtrado.iloc[0]
-                    return formatar_resposta(row_unica)
+                    return formatar_resposta(filtrado.iloc[0])
 
-                # Caso contrário, lista os submenus disponíveis com o aviso de encerramento
+                # Se tiver vários submenus, lista todos com instruções bem visíveis
                 cat_nome = filtrado.iloc[0].get('Categoria ', 'Atendimento')
-                sub_texto = f"📌 *{cat_nome} — Submenus Disponíveis:*\n\nEscolha o assunto digitando o número correspondente (ex: {int(num_opcao)}.1) ou envie *0* para encerrar:\n\n"
+                sub_texto = (
+                    f"📌 *{cat_nome}*\n\n"
+                    f"Digite o número da opção desejada (exemplo: *{int(num_opcao)}.1*):\n\n"
+                )
 
                 for _, row in filtrado.iterrows():
                     sub_num = int(row.get('Numero_Submenu', 1))
                     proc = row.get('Processo ', '')
                     sub_texto += f"• *{int(num_opcao)}.{sub_num}* — {proc}\n"
 
-                sub_texto += "\n*(Ou envie 'menu' para voltar ao início)*"
+                sub_texto += (
+                    "\n-----------------------------------\n"
+                    "💡 *Outras opções:*\n"
+                    "• Digite *menu* para voltar ao menu principal\n"
+                    "• Digite *0* para encerrar o atendimento"
+                )
                 return sub_texto
 
-        # 4. Se o utilizador enviou um submenu composto (ex: "1.1", "6.4", etc.)
+        # --- PASSO D: ESCOLHA DE UM SUBMENU ESPECÍFICO (ex: 1.1, 2.3, 6.4) ---
         if "." in pergunta_limpa:
             try:
                 partes = pergunta_limpa.split(".")
@@ -103,12 +134,11 @@ def consultar_excel(pergunta):
 
                 encontrado = df_faq[(df_faq['Numero_Menu'] == menu_num) & (df_faq['Numero_Submenu'] == sub_num)]
                 if not encontrado.empty:
-                    row = encontrado.iloc[0]
-                    return formatar_resposta(row)
+                    return formatar_resposta(encontrado.iloc[0])
             except Exception as e:
                 print(f"Erro ao processar submenu: {e}")
 
-        # 5. Procura textual por palavras-chave
+        # --- PASSO E: BUSCA POR PALAVRAS-CHAVE DIGITADAS ---
         for _, row in df_faq.iterrows():
             categoria = str(row.get("Categoria ", "")).lower()
             processo = str(row.get("Processo ", "")).lower()
@@ -117,15 +147,23 @@ def consultar_excel(pergunta):
             if (pergunta_limpa in palavras_chave) or (pergunta_limpa in processo) or (pergunta_limpa in categoria):
                 return formatar_resposta(row)
 
-        return "Desculpa, não encontrei nenhuma informação correspondente. Podes enviar 'menu' para ver as opções disponíveis ou reformular a pergunta?"
+        # --- PASSO F: MENSAGEM QUANDO NÃO ENTENDE O QUE FOI DIGITADO ---
+        return (
+            "Desculpe, não encontrei essa opção no diretório acadêmico. 🤔\n\n"
+            "• Digite *menu* para ver as opções disponíveis\n"
+            "• Digite *0* para encerrar o atendimento"
+        )
 
     except Exception as e:
-        return f"Ocorreu um erro ao processar os dados académicos: {str(e)}"
+        return f"Ocorreu um erro ao processar os dados acadêmicos: {str(e)}"
 
 
+# ==============================================================================
+# 4. ENVIO DE MENSAGENS E ROTA DO WEBHOOK
+# ==============================================================================
 def enviar_mensagem_whatsapp(numero_destino, texto_resposta):
     """
-    Envia a resposta de volta para o WhatsApp utilizando a Evolution API.
+    Envia o texto formatado de volta para o WhatsApp do aluno via Evolution API.
     """
     url = f"{EVOLUTION_API_URL}/message/sendText/{INSTANCE_NAME}"
     headers = {
@@ -148,7 +186,7 @@ def enviar_mensagem_whatsapp(numero_destino, texto_resposta):
 @app.route("/webhook", methods=["POST"])
 def webhook():
     """
-    Rota principal que recebe os eventos do WhatsApp via Evolution API.
+    Recebe as notificações de novas mensagens da Evolution API.
     """
     dados = request.json
 
@@ -158,21 +196,27 @@ def webhook():
             message_data = dados.get("data", {})
             remote_jid = message_data.get("key", {}).get("remoteJid", "")
 
+            # Ignora mensagens enviadas pelo próprio bot
             if message_data.get("key", {}).get("fromMe", False):
                 return jsonify({"status": "ignored"}), 200
 
+            # Ignora mensagens de grupos (@g.us)
             if remote_jid.endswith("@g.us"):
                 return jsonify({"status": "group_ignored"}), 200
 
             numero_limpo = remote_jid.split("@")[0]
 
+            # Ignora contatos presentes na aba de bloqueados do Excel
             numeros_bloqueados = carregar_numeros_bloqueados()
             if numero_limpo in numeros_bloqueados:
                 return jsonify({"status": "blocked_number"}), 200
 
+            # Extrai o texto da mensagem
             message_content = message_data.get("message", {})
-            texto_mensagem = message_content.get("conversation") or message_content.get("extendedTextMessage", {}).get(
-                "text", "")
+            texto_mensagem = (
+                    message_content.get("conversation")
+                    or message_content.get("extendedTextMessage", {}).get("text", "")
+            )
 
             if texto_mensagem and numero_limpo:
                 resposta_bot = consultar_excel(texto_mensagem)
