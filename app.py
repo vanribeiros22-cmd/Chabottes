@@ -1,7 +1,8 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import pandas as pd
 import requests
 import os
+from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
 
@@ -13,34 +14,133 @@ INSTANCE_NAME = "sofia-bot"
 API_KEY = "cetrus2026teste"
 
 EXCEL_FILE = "diretorio_academico.xlsx"
-
-# Memória temporária que guarda os números que estão em atendimento humano (bot pausado)
-atendimentos_humanos_ativos = set()
+FUSO_BR = timezone(timedelta(hours=-3))
 
 
 # ==============================================================================
-# 2. FUNÇÕES AUXILIARES (BLOQUEIO E FORMATAÇÃO)
+# 2. FUNÇÕES AUXILIARES (NORMALIZAÇÃO, BLOQUEIO, PAUSA E MÉTRICAS)
 # ==============================================================================
+def normalizar_telefone(numero):
+    """
+    Padroniza o número de telefone (DDD + últimos 8 dígitos) para evitar
+    falhas entre o número recebido e o enviado com/sem o 9º dígito.
+    """
+    apenas_digitos = "".join(filter(str.isdigit, str(numero)))
+    if len(apenas_digitos) >= 10:
+        return apenas_digitos[-10:]
+    return apenas_digitos
+
+
+def agora_brasil():
+    """Retorna data e hora atual formatada no horário de Brasília."""
+    return datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
+
+
 def carregar_numeros_bloqueados():
-    """
-    Lê a aba 'TelefoneContatos_Bloqueados' do Excel e retorna uma lista
-    com os números que o bot deve ignorar.
-    """
+    """Lê a aba 'TelefoneContatos_Bloqueados' e retorna os números normalizados."""
     try:
         if not os.path.exists(EXCEL_FILE):
             return []
         df_bloq = pd.read_excel(EXCEL_FILE, sheet_name="TelefoneContatos_Bloqueados")
-        return [str(num).strip() for num in df_bloq["Telefone"].dropna().tolist()]
+        return [normalizar_telefone(num) for num in df_bloq["Telefone"].dropna().tolist()]
     except Exception as e:
         print(f"Erro ao carregar números bloqueados: {e}")
         return []
 
 
+def gerenciar_estado_humano(numero_norm, acao="verificar"):
+    """
+    Salva e consulta na aba 'Controle_Alunos' do Excel se o aluno está
+    em atendimento humano (bot pausado).
+    """
+    try:
+        if not os.path.exists(EXCEL_FILE):
+            return False
+
+        todas_abas = pd.read_excel(EXCEL_FILE, sheet_name=None)
+        df_controle = todas_abas.get(
+            "Controle_Alunos",
+            pd.DataFrame(columns=["ID_Usuario", "Nome_Aluno", "Status", "Ultima_Interacao", "Etapa", "Humano"])
+        )
+        df_controle["ID_Usuario"] = df_controle["ID_Usuario"].astype(str)
+
+        if acao == "verificar":
+            reg = df_controle[df_controle["ID_Usuario"] == numero_norm]
+            if not reg.empty:
+                return str(reg.iloc[-1]["Humano"]).strip().upper() == "SIM"
+            return False
+
+        elif acao in ["ativar", "desativar"]:
+            status_humano = "SIM" if acao == "ativar" else "NAO"
+            etapa_atual = "Atendimento Humano" if acao == "ativar" else "Finalizado"
+
+            if numero_norm in df_controle["ID_Usuario"].values:
+                df_controle.loc[df_controle["ID_Usuario"] == numero_norm, "Humano"] = status_humano
+                df_controle.loc[df_controle["ID_Usuario"] == numero_norm, "Ultima_Interacao"] = agora_brasil()
+                df_controle.loc[df_controle["ID_Usuario"] == numero_norm, "Etapa"] = etapa_atual
+            else:
+                nova_linha = pd.DataFrame([{
+                    "ID_Usuario": numero_norm,
+                    "Nome_Aluno": "Aluno WhatsApp",
+                    "Status": "Ativo",
+                    "Ultima_Interacao": agora_brasil(),
+                    "Etapa": etapa_atual,
+                    "Humano": status_humano
+                }])
+                df_controle = pd.concat([df_controle, nova_linha], ignore_index=True)
+
+            todas_abas["Controle_Alunos"] = df_controle
+            with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl") as writer:
+                for nome_aba, df_aba in todas_abas.items():
+                    df_aba.to_excel(writer, sheet_name=nome_aba, index=False)
+            return True
+
+    except Exception as e:
+        print(f"Erro ao gerenciar estado humano no Excel: {e}")
+        return False
+
+
+def registrar_metrica(numero_aluno, categoria, processo, duvida, desfecho, resolvido="Sim"):
+    """
+    Grava automaticamente cada interação na aba 'Metricas_Atendimentos ' do Excel.
+    """
+    try:
+        if not os.path.exists(EXCEL_FILE):
+            return
+
+        todas_abas = pd.read_excel(EXCEL_FILE, sheet_name=None)
+        nome_aba_metricas = "Metricas_Atendimentos " if "Metricas_Atendimentos " in todas_abas else "Metricas_Atendimentos"
+
+        df_met = todas_abas.get(
+            nome_aba_metricas,
+            pd.DataFrame(columns=["ID_Log", "Data_Hora", "ID_Usuario", "Canal", "Categoria", "Processo", "Duvida_Aluno", "Desfecho", "Resolvido"])
+        )
+
+        novo_id = len(df_met) + 1
+        nova_linha = pd.DataFrame([{
+            "ID_Log": novo_id,
+            "Data_Hora": agora_brasil(),
+            "ID_Usuario": numero_aluno,
+            "Canal": "WhatsApp",
+            "Categoria": categoria,
+            "Processo": processo,
+            "Duvida_Aluno": duvida,
+            "Desfecho": desfecho,
+            "Resolvido": resolvido
+        }])
+
+        todas_abas[nome_aba_metricas] = pd.concat([df_met, nova_linha], ignore_index=True)
+
+        with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl") as writer:
+            for nome_aba, df_aba in todas_abas.items():
+                df_aba.to_excel(writer, sheet_name=nome_aba, index=False)
+
+    except Exception as e:
+        print(f"Erro ao registrar métrica: {e}")
+
+
 def formatar_resposta(row):
-    """
-    Monta a mensagem final da resposta com título, instruções, link (se houver)
-    e opções claras de navegação no rodapé.
-    """
+    """Monta a mensagem final da resposta com título, instruções e rodapé."""
     cat = row.get('Categoria ', '')
     proc = row.get('Processo ', '')
     resp = row.get('Instrucoes_Tecnicas', 'Consulte os detalhes no portal.')
@@ -48,11 +148,9 @@ def formatar_resposta(row):
 
     texto_final = f"📌 *{cat} — {proc}*\n\n{resp}"
 
-    # Se existir um link na coluna Link_Arquivo, anexa à mensagem
     if pd.notna(link_arquivo) and str(link_arquivo).strip() != "":
         texto_final += f"\n\n📂 *Material / Documento Associado:*\n{str(link_arquivo).strip()}"
 
-    # Adiciona orientação clara ao final de cada resposta
     texto_final += (
         "\n\n-----------------------------------\n"
         "💡 *Como continuar:*\n"
@@ -65,10 +163,8 @@ def formatar_resposta(row):
 # ==============================================================================
 # 3. MOTOR DE CONSULTA AO EXCEL (MENUS, SUBMENUS, PAUSA E ENCERRAMENTO)
 # ==============================================================================
-def consultar_excel(pergunta, numero_aluno):
-    """
-    Processa a mensagem recebida do aluno e decide qual resposta enviar.
-    """
+def consultar_excel(pergunta, numero_aluno_norm):
+    """Processa a mensagem do aluno, registra métricas e retorna a resposta."""
     try:
         if not os.path.exists(EXCEL_FILE):
             return "⚠️ Erro: Arquivo de diretório acadêmico não encontrado no servidor."
@@ -78,8 +174,8 @@ def consultar_excel(pergunta, numero_aluno):
         # --- PASSO A: COMANDO DE ENCERRAMENTO GLOBAL ---
         comandos_saida = ["0", "encerrar", "sair", "encerrar atendimento", "#finalizar"]
         if pergunta_limpa in comandos_saida:
-            # Garante que o aluno sai do modo de atendimento humano caso estivesse nele
-            atendimentos_humanos_ativos.discard(numero_aluno)
+            gerenciar_estado_humano(numero_aluno_norm, acao="desativar")
+            registrar_metrica(numero_aluno_norm, "Encerramento", "Saída do Usuário", pergunta, "Atendimento Encerrado", "Sim")
             return (
                 "Atendimento encerrado. Obrigado pelo contato! 💙\n\n"
                 "Se precisar de algo, é só enviar uma nova mensagem a qualquer momento."
@@ -89,6 +185,7 @@ def consultar_excel(pergunta, numero_aluno):
         comandos_menu = ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "menu", "ajuda"]
         if pergunta_limpa in comandos_menu:
             df_menu = pd.read_excel(EXCEL_FILE, sheet_name="Menu_Principal")
+            registrar_metrica(numero_aluno_norm, "Menu Principal", "Início / Boas-vindas", pergunta, "Exibiu Menu Principal", "Sim")
             menu_texto = (
                 "👋 Bem-vinda(o) ao atendimento acadêmico da Sofia!\n\n"
                 "Escolha uma das opções abaixo digitando apenas o *número* correspondente:\n\n"
@@ -103,14 +200,14 @@ def consultar_excel(pergunta, numero_aluno):
         if pergunta_limpa.isdigit() and len(pergunta_limpa) == 1:
             num_opcao = float(pergunta_limpa)
 
-            # Se for a opção 5 (Atendimento Humano), ativa a pausa do bot para este número!
+            # Opção 5: Transferência para Atendimento Humano (Ativa Pausa no Excel)
             if num_opcao == 5.0:
-                atendimentos_humanos_ativos.add(numero_aluno)
+                gerenciar_estado_humano(numero_aluno_norm, acao="ativar")
+                registrar_metrica(numero_aluno_norm, "Atendimento Humano", "Transbordo Humano", pergunta, "Transferido para Atendente", "Em andamento")
                 filtrado_5 = df_faq[df_faq['Numero_Menu'] == 5.0]
                 msg_humano = "👩‍💻 *Transferindo para o Atendimento Humano...*\n\n"
                 if not filtrado_5.empty:
-                    msg_humano += str(filtrado_5.iloc[0].get('Instrucoes_Tecnicas',
-                                                             'Aguarde um momento, um de nossos atendentes já vai falar com você.'))
+                    msg_humano += str(filtrado_5.iloc[0].get('Instrucoes_Tecnicas', 'Aguarde um momento, um de nossos atendentes já vai falar com você.'))
                 else:
                     msg_humano += "Aguarde um momento, um de nossos atendentes já vai falar com você."
 
@@ -120,12 +217,13 @@ def consultar_excel(pergunta, numero_aluno):
             filtrado = df_faq[df_faq['Numero_Menu'] == num_opcao]
 
             if not filtrado.empty:
-                # Se a opção tiver apenas 1 item, envia direto
                 if len(filtrado) == 1:
-                    return formatar_resposta(filtrado.iloc[0])
+                    row_unica = filtrado.iloc[0]
+                    registrar_metrica(numero_aluno_norm, row_unica.get('Categoria ', ''), row_unica.get('Processo ', ''), pergunta, "Resposta Direta", "Sim")
+                    return formatar_resposta(row_unica)
 
-                # Se tiver vários submenus, lista todos com instruções bem visíveis
                 cat_nome = filtrado.iloc[0].get('Categoria ', 'Atendimento')
+                registrar_metrica(numero_aluno_norm, cat_nome, "Listagem Submenu", pergunta, "Exibiu Submenus", "Sim")
                 sub_texto = (
                     f"📌 *{cat_nome}*\n\n"
                     f"Digite o número da opção desejada (exemplo: *{int(num_opcao)}.1*):\n\n"
@@ -151,13 +249,14 @@ def consultar_excel(pergunta, numero_aluno):
                 menu_num = float(partes[0])
                 sub_num = float(partes[-1])
 
-                # Se o aluno digitar 5.1 diretamente, também ativa o atendimento humano
                 if menu_num == 5.0:
-                    atendimentos_humanos_ativos.add(numero_aluno)
+                    gerenciar_estado_humano(numero_aluno_norm, acao="ativar")
 
                 encontrado = df_faq[(df_faq['Numero_Menu'] == menu_num) & (df_faq['Numero_Submenu'] == sub_num)]
                 if not encontrado.empty:
-                    return formatar_resposta(encontrado.iloc[0])
+                    row = encontrado.iloc[0]
+                    registrar_metrica(numero_aluno_norm, row.get('Categoria ', ''), row.get('Processo ', ''), pergunta, "Resposta Submenu", "Sim")
+                    return formatar_resposta(row)
             except Exception as e:
                 print(f"Erro ao processar submenu: {e}")
 
@@ -168,9 +267,11 @@ def consultar_excel(pergunta, numero_aluno):
             palavras_chave = str(row.get("Palavras_Chave", "")).lower()
 
             if (pergunta_limpa in palavras_chave) or (pergunta_limpa in processo) or (pergunta_limpa in categoria):
+                registrar_metrica(numero_aluno_norm, row.get('Categoria ', ''), row.get('Processo ', ''), pergunta, "Busca Palavra-Chave", "Sim")
                 return formatar_resposta(row)
 
-        # --- PASSO F: MENSAGEM QUANDO NÃO ENTENDE O QUE FOI DIGITADO ---
+        # --- PASSO F: MENSAGEM QUANDO NÃO ENTENDE ---
+        registrar_metrica(numero_aluno_norm, "Não Identificado", "Fallback", pergunta, "Opção não encontrada", "Não")
         return (
             "Desculpe, não encontrei essa opção no diretório acadêmico. 🤔\n\n"
             "• Digite *menu* para ver as opções disponíveis\n"
@@ -182,12 +283,10 @@ def consultar_excel(pergunta, numero_aluno):
 
 
 # ==============================================================================
-# 4. ENVIO DE MENSAGENS E ROTA DO WEBHOOK
+# 4. ENVIO DE MENSAGENS, DOWNLOAD DE MÉTRICAS E ROTA DO WEBHOOK
 # ==============================================================================
 def enviar_mensagem_whatsapp(numero_destino, texto_resposta):
-    """
-    Envia o texto formatado de volta para o WhatsApp do aluno via Evolution API.
-    """
+    """Envia o texto formatado de volta para o WhatsApp via Evolution API."""
     url = f"{EVOLUTION_API_URL}/message/sendText/{INSTANCE_NAME}"
     headers = {
         "Content-Type": "application/json",
@@ -206,11 +305,24 @@ def enviar_mensagem_whatsapp(numero_destino, texto_resposta):
         return None
 
 
+@app.route("/metricas", methods=["GET"])
+def baixar_metricas():
+    """
+    Rota para baixar a planilha Excel atualizada com todas as métricas
+    e controle de atendimento registrados até o momento.
+    """
+    if os.path.exists(EXCEL_FILE):
+        return send_file(
+            EXCEL_FILE,
+            as_attachment=True,
+            download_name=f"relatorio_sofia_{datetime.now(FUSO_BR).strftime('%Y%m%d_%H%M')}.xlsx"
+        )
+    return jsonify({"erro": "Planilha não encontrada no servidor."}), 404
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """
-    Recebe as notificações de novas mensagens da Evolution API.
-    """
+    """Recebe as notificações de novas mensagens da Evolution API."""
     dados = request.json
 
     try:
@@ -220,51 +332,58 @@ def webhook():
             remote_jid = message_data.get("key", {}).get("remoteJid", "")
             from_me = message_data.get("key", {}).get("fromMe", False)
 
-            # Ignora mensagens de grupos (@g.us)
             if remote_jid.endswith("@g.us"):
                 return jsonify({"status": "group_ignored"}), 200
 
-            numero_limpo = remote_jid.split("@")[0]
+            numero_bruto = remote_jid.split("@")[0]
+            numero_norm = normalizar_telefone(numero_bruto)
 
-            # Extrai o texto da mensagem
             message_content = message_data.get("message", {})
             texto_mensagem = (
-                    message_content.get("conversation")
-                    or message_content.get("extendedTextMessage", {}).get("text", "")
+                message_content.get("conversation")
+                or message_content.get("extendedTextMessage", {}).get("text", "")
             )
 
-            # --- VERIFICAÇÃO DO ATENDENTE HUMANO (MENSAGEM ENVIADA PELO PRÓPRIO NÚMERO) ---
+            if not texto_mensagem:
+                return jsonify({"status": "no_text"}), 200
+
+            # --- VERIFICAÇÃO DO ATENDENTE HUMANO (MENSAGEM ENVIADA PELO APARELHO DA INSTITUIÇÃO) ---
             if from_me:
-                # Se o atendente enviar "#finalizar" na conversa do aluno, reativa o robô!
-                if texto_mensagem and "#finalizar" in texto_mensagem.lower():
-                    atendimentos_humanos_ativos.discard(numero_limpo)
+                # 1. Se o atendente enviar "#finalizar", reativa o robô e encerra!
+                if "#finalizar" in texto_mensagem.lower():
+                    gerenciar_estado_humano(numero_norm, acao="desativar")
+                    registrar_metrica(numero_norm, "Atendimento Humano", "Finalização Atendente", "#finalizar", "Atendimento Humano Concluído", "Sim")
                     enviar_mensagem_whatsapp(
-                        numero_limpo,
+                        numero_bruto,
                         "Atendimento humano finalizado. Obrigado pelo contato! 💙\n\nSe precisar de algo novamente, basta enviar *oi* ou *menu*."
                     )
+                # 2. Se o atendente digitar manualmente uma mensagem (que não seja gerada pelo próprio robô),
+                # coloca o chat em pausa automaticamente para o robô não atrapalhar!
+                elif not texto_mensagem.startswith(("👋", "📌", "👩‍💻", "Desculpe,", "Atendimento encerrado", "Atendimento humano")):
+                    gerenciar_estado_humano(numero_norm, acao="ativar")
                 return jsonify({"status": "from_me_processed"}), 200
 
-            # Ignora contatos presentes na aba de bloqueados do Excel
+            # Ignora contatos presentes na aba de bloqueados
             numeros_bloqueados = carregar_numeros_bloqueados()
-            if numero_limpo in numeros_bloqueados:
+            if numero_norm in numeros_bloqueados:
                 return jsonify({"status": "blocked_number"}), 200
 
             # --- VERIFICAÇÃO DE PAUSA (SE ESTIVER COM HUMANO, O ROBÔ FICA EM SILÊNCIO) ---
-            if numero_limpo in atendimentos_humanos_ativos:
-                # Permite apenas que o próprio aluno encerre caso envie "0" ou "#finalizar"
+            if gerenciar_estado_humano(numero_norm, acao="verificar"):
                 if texto_mensagem.strip().lower() in ["0", "#finalizar"]:
-                    atendimentos_humanos_ativos.discard(numero_limpo)
+                    gerenciar_estado_humano(numero_norm, acao="desativar")
+                    registrar_metrica(numero_norm, "Atendimento Humano", "Encerrado pelo Aluno", texto_mensagem, "Encerrado pelo Aluno", "Sim")
                     enviar_mensagem_whatsapp(
-                        numero_limpo,
+                        numero_bruto,
                         "Atendimento encerrado. Obrigado pelo contato! 💙\n\nSe precisar de algo, é só enviar uma nova mensagem a qualquer momento."
                     )
                 else:
-                    print(f"Bot pausado para {numero_limpo} (em atendimento humano).")
+                    print(f"Bot pausado para {numero_norm} (em atendimento humano).")
                 return jsonify({"status": "paused_for_human"}), 200
 
-            if texto_mensagem and numero_limpo:
-                resposta_bot = consultar_excel(texto_mensagem, numero_limpo)
-                enviar_mensagem_whatsapp(numero_limpo, resposta_bot)
+            # Processa fluxo normal do bot
+            resposta_bot = consultar_excel(texto_mensagem, numero_norm)
+            enviar_mensagem_whatsapp(numero_bruto, resposta_bot)
 
     except Exception as e:
         print(f"Erro no webhook: {e}")
