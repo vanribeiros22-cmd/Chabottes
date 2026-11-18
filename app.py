@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file, render_template_string
+from flask import Flask, request, jsonify, send_file, render_template_string, redirect, url_for
 import pandas as pd
 import requests
 import os
@@ -12,6 +12,7 @@ app = Flask(__name__)
 EVOLUTION_API_URL = "https://evolution-api-production-db931012.up.railway.app"
 INSTANCE_NAME = "sofia-oficial"
 API_KEY = "cetrus2026teste"
+WEBHOOK_PUBLIC_URL = "https://chattest-production-37ef5795.up.railway.app/webhook"
 
 EXCEL_FILE = "diretorio_academico.xlsx"
 FUSO_BR = timezone(timedelta(hours=-3))
@@ -23,7 +24,6 @@ pausa_memoria = set()
 # 2. FUNÇÕES AUXILIARES (NORMALIZAÇÃO, BLOQUEIO, PAUSA E MÉTRICAS)
 # ==============================================================================
 def normalizar_telefone(numero):
-    """Padroniza o número (DDD + últimos 8 dígitos) para evitar falhas do 9º dígito."""
     if not numero:
         return ""
     numero_str = str(numero).split("@")[0]
@@ -34,7 +34,6 @@ def normalizar_telefone(numero):
 
 
 def formatar_para_envio(numero):
-    """Garante o DDI 55 para números brasileiros digitados manualmente."""
     numero_str = str(numero).split("@")[0]
     apenas_digitos = "".join(filter(str.isdigit, numero_str))
     if len(apenas_digitos) in [10, 11]:
@@ -46,21 +45,62 @@ def agora_brasil():
     return datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
 
 
+def configurar_webhook_automatico():
+    """
+    Configura automaticamente o Webhook na Evolution API para a instância oficial,
+    garantindo que MESSAGES_UPSERT e SEND_MESSAGE estejam ativos.
+    """
+    headers = {"Content-Type": "application/json", "apikey": API_KEY}
+    payload_v2 = {
+        "webhook": {
+            "enabled": True,
+            "url": WEBHOOK_PUBLIC_URL,
+            "webhookByEvents": False,
+            "webhookBase64": False,
+            "events": ["MESSAGES_UPSERT", "SEND_MESSAGE"]
+        }
+    }
+    try:
+        r = requests.post(
+            f"{EVOLUTION_API_URL}/webhook/set/{INSTANCE_NAME}",
+            json=payload_v2,
+            headers=headers,
+            timeout=10
+        )
+        if r.status_code in [200, 201]:
+            return True, f"Webhook ativado com sucesso para {INSTANCE_NAME}!"
+
+        # Fallback para formato plano caso a versão da API espere sem chave 'webhook'
+        payload_plano = {
+            "enabled": True,
+            "url": WEBHOOK_PUBLIC_URL,
+            "webhookByEvents": False,
+            "events": ["MESSAGES_UPSERT", "SEND_MESSAGE"]
+        }
+        r2 = requests.post(
+            f"{EVOLUTION_API_URL}/webhook/set/{INSTANCE_NAME}",
+            json=payload_plano,
+            headers=headers,
+            timeout=10
+        )
+        if r2.status_code in [200, 201]:
+            return True, f"Webhook ativado com sucesso para {INSTANCE_NAME}!"
+        return False, f"Erro HTTP {r.status_code}: {r.text}"
+    except Exception as e:
+        return False, f"Falha de conexão com Evolution API: {str(e)}"
+
+
 def buscar_contatos_whatsapp():
-    """
-    Consulta a Evolution API para listar os contatos e chats já sincronizados
-    no WhatsApp oficial, ordenados por nome.
-    """
+    """Consulta a Evolution API para listar contatos e chats sincronizados."""
     contatos_unicos = {}
     headers = {"Content-Type": "application/json", "apikey": API_KEY}
 
-    # 1. Busca contatos salvos na agenda do WhatsApp
     try:
         resp_contacts = requests.post(
             f"{EVOLUTION_API_URL}/chat/findContacts/{INSTANCE_NAME}",
             json={},
             headers=headers,
-            timeout=10
+            timeout=8
         )
         if resp_contacts.status_code == 200:
             lista = resp_contacts.json()
@@ -72,15 +112,14 @@ def buscar_contatos_whatsapp():
                         nome = item.get("pushName") or item.get("name") or item.get("verifiedName") or num
                         contatos_unicos[num] = f"{nome} ({num})"
     except Exception as e:
-        print(f"[AVISO] Erro ao buscar findContacts: {e}")
+        print(f"[AVISO] Erro findContacts: {e}")
 
-    # 2. Complementa com conversas recentes (chats) caso algum não tenha nome salvo
     try:
         resp_chats = requests.post(
             f"{EVOLUTION_API_URL}/chat/findChats/{INSTANCE_NAME}",
             json={},
             headers=headers,
-            timeout=10
+            timeout=8
         )
         if resp_chats.status_code == 200:
             chats = resp_chats.json()
@@ -93,12 +132,26 @@ def buscar_contatos_whatsapp():
                             nome = chat.get("name") or chat.get("pushName") or num
                             contatos_unicos[num] = f"{nome} ({num})"
     except Exception as e:
-        print(f"[AVISO] Erro ao buscar findChats: {e}")
+        print(f"[AVISO] Erro findChats: {e}")
 
-    # Retorna lista ordenada alfabeticamente pelo rótulo
     lista_ordenada = [{"numero": k, "rotulo": v} for k, v in contatos_unicos.items()]
     lista_ordenada.sort(key=lambda x: x["rotulo"].lower())
     return lista_ordenada
+
+
+def listar_atendimentos_pausados():
+    """Retorna a lista de números que estão atualmente em atendimento humano."""
+    pausados = set(pausa_memoria)
+    try:
+        if os.path.exists(EXCEL_FILE):
+            df_controle = pd.read_excel(EXCEL_FILE, sheet_name="Controle_Alunos")
+            if not df_controle.empty and "Humano" in df_controle.columns:
+                ativos = df_controle[df_controle["Humano"].astype(str).str.upper() == "SIM"]
+                for num in ativos["ID_Usuario"].dropna().tolist():
+                    pausados.add(str(num))
+    except Exception as e:
+        print(f"[AVISO] Erro ao listar pausados: {e}")
+    return sorted(list(pausados))
 
 
 def carregar_numeros_bloqueados():
@@ -108,7 +161,7 @@ def carregar_numeros_bloqueados():
         df_bloq = pd.read_excel(EXCEL_FILE, sheet_name="TelefoneContatos_Bloqueados")
         return [normalizar_telefone(num) for num in df_bloq["Telefone"].dropna().tolist()]
     except Exception as e:
-        print(f"[ERRO] Falha ao carregar números bloqueados: {e}")
+        print(f"[ERRO] Falha ao carregar bloqueados: {e}")
         return []
 
 
@@ -357,7 +410,7 @@ def consultar_excel(pergunta, numero_aluno_norm):
 
 
 # ==============================================================================
-# 4. ROTAS WEB (/status, /iniciar, /metricas, /webhook)
+# 4. ENVIO DE MENSAGENS, PAINEL ÚNICO (/) E WEBHOOK
 # ==============================================================================
 def enviar_mensagem_whatsapp(numero_destino, texto_resposta):
     url = f"{EVOLUTION_API_URL}/message/sendText/{INSTANCE_NAME}"
@@ -371,7 +424,7 @@ def enviar_mensagem_whatsapp(numero_destino, texto_resposta):
     }
 
     try:
-        response = requests.post(url, json=payload, headers=headers)
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
         print(f"[ENVIO API] Status: {response.status_code} | Destino: {numero_destino} | Resp: {response.text}")
         return response.json()
     except Exception as e:
@@ -379,83 +432,130 @@ def enviar_mensagem_whatsapp(numero_destino, texto_resposta):
         return None
 
 
-@app.route("/status", methods=["GET"])
-def verificar_status():
-    try:
-        resp = requests.get(
-            f"{EVOLUTION_API_URL}/instance/fetchInstances",
-            headers={"apikey": API_KEY},
-            timeout=10
-        )
-        return jsonify({
-            "servidor_flask": "ONLINE",
-            "instancia_configurada_no_codigo": INSTANCE_NAME,
-            "excel_encontrado": os.path.exists(EXCEL_FILE),
-            "instancias_na_evolution_api": resp.json()
-        }), 200
-    except Exception as e:
-        return jsonify({"erro": str(e)}), 500
-
-
+@app.route("/", methods=["GET", "POST"])
 @app.route("/iniciar", methods=["GET", "POST"])
-def iniciar_contato():
+def painel_central():
     """
-    Painel web para iniciar contato com os contatos já salvos no WhatsApp
-    ou com um número digitado manualmente.
+    Painel Único com botões para todas as funções do sistema:
+    - Ativar Webhook Oficial
+    - Baixar Planilha de Métricas
+    - Iniciar Contato com Contatos do WhatsApp ou Número Manual
+    - Gerenciar Fila de Atendimento Humano (Pausar / Reativar)
     """
-    resultado = ""
-    contatos_lista = buscar_contatos_whatsapp()
+    alerta = ""
+    tipo_alerta = "info"
 
     if request.method == "POST":
+        acao = request.form.get("acao", "")
         senha = request.form.get("senha", "")
-        contato_selecionado = request.form.get("contato_salvo", "")
-        numero_manual = request.form.get("numero_manual", "")
-        modo = request.form.get("modo", "menu")
-        mensagem_custom = request.form.get("mensagem", "")
-
-        numero_final = numero_manual.strip() if numero_manual.strip() else contato_selecionado.strip()
 
         if senha != API_KEY:
-            resultado = "❌ Chave de acesso incorreta."
-        elif not numero_final:
-            resultado = "❌ Selecione um contato da lista ou digite um número."
+            alerta = "❌ Senha incorreta! Digite a chave de acesso correta."
+            tipo_alerta = "erro"
         else:
-            num_envio = formatar_para_envio(numero_final)
-            num_norm = normalizar_telefone(num_envio)
+            # AÇÃO 1: ATIVAR WEBHOOK DA INSTÂNCIA OFICIAL
+            if acao == "ativar_webhook":
+                ok, msg = configurar_webhook_automatico()
+                alerta = f"✅ {msg}" if ok else f"❌ {msg}"
+                tipo_alerta = "ok" if ok else "erro"
 
-            if modo == "menu":
-                gerenciar_estado_humano(num_norm, acao="desativar")
-                texto_para_enviar = gerar_texto_menu_principal()
-                registrar_metrica(num_norm, "Contato Ativo", "Disparo Menu Sofia", "Início Ativo", "Menu Enviado",
-                                  "Sim")
-            else:
-                gerenciar_estado_humano(num_norm, acao="ativar")
-                texto_para_enviar = mensagem_custom.strip() or "Olá! Tudo bem? Aqui é da equipe acadêmica, como posso ajudar?"
-                registrar_metrica(num_norm, "Contato Ativo", "Disparo Humano", texto_para_enviar,
-                                  "Atendimento Humano Iniciado", "Em andamento")
+            # AÇÃO 2: INICIAR CONTATO COM ALUNO
+            elif acao == "iniciar_contato":
+                contato_salvo = request.form.get("contato_salvo", "").strip()
+                numero_manual = request.form.get("numero_manual", "").strip()
+                modo = request.form.get("modo", "menu")
+                mensagem_custom = request.form.get("mensagem", "").strip()
 
-            resp = enviar_mensagem_whatsapp(num_envio, texto_para_enviar)
-            if resp and ("key" in str(resp) or "PENDING" in str(resp) or "status" in str(resp)):
-                resultado = f"✅ Mensagem enviada com sucesso para {num_envio}!"
-            else:
-                resultado = f"⚠️ Resposta da API: {resp}"
+                numero_final = numero_manual if numero_manual else contato_salvo
+                if not numero_final:
+                    alerta = "❌ Selecione um contato da lista ou digite um número."
+                    tipo_alerta = "erro"
+                else:
+                    num_envio = formatar_para_envio(numero_final)
+                    num_norm = normalizar_telefone(num_envio)
+
+                    if modo == "menu":
+                        gerenciar_estado_humano(num_norm, acao="desativar")
+                        texto_envio = gerar_texto_menu_principal()
+                        registrar_metrica(num_norm, "Contato Ativo", "Disparo Menu Sofia", "Início Ativo",
+                                          "Menu Enviado", "Sim")
+                    else:
+                        gerenciar_estado_humano(num_norm, acao="ativar")
+                        texto_envio = mensagem_custom or "Olá! Tudo bem? Aqui é da equipe acadêmica, como posso ajudar?"
+                        registrar_metrica(num_norm, "Contato Ativo", "Disparo Humano", texto_envio,
+                                          "Atendimento Humano Iniciado", "Em andamento")
+
+                    resp = enviar_mensagem_whatsapp(num_envio, texto_envio)
+                    if resp and ("key" in str(resp) or "PENDING" in str(resp) or "status" in str(resp)):
+                        alerta = f"✅ Mensagem enviada para {num_envio}!"
+                        tipo_alerta = "ok"
+                    else:
+                        alerta = f"⚠️ Resposta da API: {resp}"
+                        tipo_alerta = "erro"
+
+            # AÇÃO 3: PAUSAR OU REATIVAR UM NÚMERO MANUALMENTE
+            elif acao == "reativar_robo":
+                num_target = request.form.get("num_target", "")
+                gerenciar_estado_humano(num_target, acao="desativar")
+                alerta = f"✅ Robô reativado para o contato {num_target}!"
+                tipo_alerta = "ok"
+
+            elif acao == "pausar_robo":
+                num_pausar = normalizar_telefone(request.form.get("num_pausar", ""))
+                if num_pausar:
+                    gerenciar_estado_humano(num_pausar, acao="ativar")
+                    alerta = f"⏸️ Robô pausado (modo atendimento humano) para {num_pausar}."
+                    tipo_alerta = "ok"
+
+    # Carrega dados atualizados para exibir na tela
+    contatos_lista = buscar_contatos_whatsapp()
+    pausados_lista = listar_atendimentos_pausados()
+    bloqueados_lista = carregar_numeros_bloqueados()
+
+    # Verifica estado atual da instância
+    status_conexao = "Desconhecido"
+    try:
+        r_st = requests.get(f"{EVOLUTION_API_URL}/instance/connectionState/{INSTANCE_NAME}",
+                            headers={"apikey": API_KEY}, timeout=5)
+        if r_st.status_code == 200:
+            status_conexao = r_st.json().get("instance", {}).get("state", "open")
+    except Exception:
+        status_conexao = "Verifique Evolution API"
 
     html = """
     <!DOCTYPE html>
     <html lang="pt-BR">
     <head>
         <meta charset="UTF-8">
-        <title>Iniciar Contato - Sofia Oficial</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Painel Central - Sofia Oficial</title>
         <style>
-            body { font-family: Arial, sans-serif; background: #f4f6f9; padding: 30px; }
-            .card { max-width: 520px; margin: auto; background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-            h2 { color: #1e293b; margin-top: 0; }
-            label { display: block; margin-top: 15px; font-weight: bold; color: #334155; }
-            input, select, textarea { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #cbd5e1; border-radius: 6px; box-sizing: border-box; }
-            button { margin-top: 20px; width: 100%; padding: 12px; background: #0f766e; color: white; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; }
-            button:hover { background: #115e59; }
-            .msg { margin-top: 15px; padding: 12px; border-radius: 6px; background: #e2e8f0; font-size: 14px; word-break: break-all; }
-            .hint { font-size: 12px; color: #64748b; margin-top: 4px; }
+            body { font-family: 'Segoe UI', Arial, sans-serif; background: #f1f5f9; margin: 0; padding: 20px; color: #1e293b; }
+            .container { max-width: 960px; margin: auto; }
+            .header { background: #0f766e; color: white; padding: 20px 25px; border-radius: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 15px; }
+            .header h1 { margin: 0; font-size: 22px; }
+            .badge { background: rgba(255,255,255,0.2); padding: 6px 12px; border-radius: 20px; font-size: 13px; }
+            .toolbar { display: flex; gap: 10px; flex-wrap: wrap; margin: 20px 0; }
+            .btn { padding: 11px 18px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; text-decoration: none; font-size: 14px; display: inline-flex; align-items: center; gap: 6px; }
+            .btn-primary { background: #0284c7; color: white; }
+            .btn-primary:hover { background: #0369a1; }
+            .btn-success { background: #16a34a; color: white; }
+            .btn-success:hover { background: #15803d; }
+            .btn-warning { background: #d97706; color: white; }
+            .btn-warning:hover { background: #b45309; }
+            .btn-teal { background: #0f766e; color: white; width: 100%; justify-content: center; font-size: 15px; margin-top: 15px; }
+            .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+            @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
+            .card { background: white; padding: 22px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+            .card h2 { margin-top: 0; font-size: 18px; color: #0f766e; border-bottom: 1px solid #e2e8f0; padding-bottom: 10px; }
+            label { display: block; margin-top: 12px; font-weight: 600; font-size: 13px; color: #475569; }
+            input, select, textarea { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #cbd5e1; border-radius: 6px; box-sizing: border-box; font-size: 14px; }
+            .alerta { padding: 14px; border-radius: 8px; margin-bottom: 20px; font-weight: bold; }
+            .alerta.ok { background: #dcfce7; color: #166534; border: 1px solid #86efac; }
+            .alerta.erro { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
+            .lista-item { display: flex; justify-content: space-between; align-items: center; padding: 10px; border-bottom: 1px solid #f1f5f9; }
+            .senha-box { background: #fffbeb; border: 1px solid #fde68a; padding: 12px 18px; border-radius: 8px; margin-bottom: 15px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+            .senha-box input { max-width: 240px; margin-top: 0; }
         </style>
         <script>
             function filtrarContatos() {
@@ -466,48 +566,127 @@ def iniciar_contato():
                     select.options[i].style.display = txt.includes(input) ? "" : "none";
                 }
             }
+            function sincronizarSenha(val) {
+                var campos = document.getElementsByClassName("campo-senha-oculto");
+                for (var i = 0; i < campos.length; i++) {
+                    campos[i].value = val;
+                }
+            }
         </script>
     </head>
     <body>
-        <div class="card">
-            <h2>📲 Iniciar Contato (Sofia Oficial)</h2>
-            <form method="POST">
-                <label>Senha de Acesso (API Key):</label>
-                <input type="password" name="senha" placeholder="Digite a chave de acesso" required>
+        <div class="container">
+            <div class="header">
+                <div>
+                    <h1>🤖 Painel Central — Sofia Oficial</h1>
+                    <small>Instância: <b>{{ instancia }}</b> | Bloqueados na lista: <b>{{ total_bloqueados }}</b></small>
+                </div>
+                <div class="badge">Status WhatsApp: <b>{{ status_conexao }}</b></div>
+            </div>
 
-                <label>1. Buscar nos Contatos Salvos no WhatsApp ({{ total_contatos }}):</label>
-                <input type="text" id="filtro" onkeyup="filtrarContatos()" placeholder="🔍 Digite o nome ou número para filtrar...">
-                <select name="contato_salvo" id="contato_salvo">
-                    <option value="">-- Selecione um contato da agenda --</option>
-                    {% for c in contatos %}
-                        <option value="{{ c.numero }}">{{ c.rotulo }}</option>
-                    {% endfor %}
-                </select>
+            <!-- CAMPO ÚNICO DE SENHA PARA TODOS OS BOTÕES -->
+            <div class="senha-box" style="margin-top: 15px;">
+                <label style="margin:0;">🔑 Chave de Acesso:</label>
+                <input type="password" id="senha_mestra" onkeyup="sincronizarSenha(this.value)" placeholder="Digite cetrus2026teste para liberar ações">
+                <small style="color:#92400e;">Digite uma vez acima para usar qualquer botão abaixo.</small>
+            </div>
 
-                <label>OU Digite um Número Novo (com DDD):</label>
-                <input type="text" name="numero_manual" placeholder="Ex: 11988887777 (deixe vazio se escolheu acima)">
-                <div class="hint">Se preencher aqui, este número terá prioridade sobre a lista acima.</div>
+            <!-- BARRA DE BOTÕES RÁPIDOS -->
+            <div class="toolbar">
+                <form method="POST" style="margin:0;">
+                    <input type="hidden" name="acao" value="ativar_webhook">
+                    <input type="hidden" name="senha" class="campo-senha-oculto">
+                    <button type="submit" class="btn btn-warning">🔌 1. Ativar/Corrigir Webhook Oficial</button>
+                </form>
 
-                <label>Como deseja iniciar?</label>
-                <select name="modo">
-                    <option value="menu">1. Enviar Menu Automático da Sofia</option>
-                    <option value="humano">2. Mensagem Manual (Pausar o Robô)</option>
-                </select>
+                <a href="/metricas" class="btn btn-success">📥 2. Baixar Planilha de Métricas (.xlsx)</a>
 
-                <label>Mensagem Personalizada (se escolheu opção 2):</label>
-                <textarea name="mensagem" rows="3" placeholder="Olá! Aqui é da secretaria acadêmica..."></textarea>
+                <a href="/" class="btn btn-primary">🔄 3. Atualizar Contatos e Fila</a>
+            </div>
 
-                <button type="submit">Enviar Mensagem Agora</button>
-            </form>
-            {% if resultado %}
-                <div class="msg">{{ resultado }}</div>
+            {% if alerta %}
+                <div class="alerta {{ tipo_alerta }}">{{ alerta }}</div>
             {% endif %}
+
+            <div class="grid">
+                <!-- COLUNA 1: INICIAR CONTATO -->
+                <div class="card">
+                    <h2>📲 Iniciar Contato com Aluno</h2>
+                    <form method="POST">
+                        <input type="hidden" name="acao" value="iniciar_contato">
+                        <input type="hidden" name="senha" class="campo-senha-oculto">
+
+                        <label>Buscar nos Contatos Salvos ({{ total_contatos }}):</label>
+                        <input type="text" id="filtro" onkeyup="filtrarContatos()" placeholder="🔍 Digite nome ou número...">
+                        <select name="contato_salvo" id="contato_salvo">
+                            <option value="">-- Selecione um contato do WhatsApp --</option>
+                            {% for c in contatos %}
+                                <option value="{{ c.numero }}">{{ c.rotulo }}</option>
+                            {% endfor %}
+                        </select>
+
+                        <label>OU Digite um Número Novo (com DDD):</label>
+                        <input type="text" name="numero_manual" placeholder="Ex: 11988887777">
+
+                        <label>Tipo de Início:</label>
+                        <select name="modo">
+                            <option value="menu">Enviar Menu Automático da Sofia</option>
+                            <option value="humano">Enviar Mensagem Manual (Pausar Robô)</option>
+                        </select>
+
+                        <label>Mensagem Manual (opcional se escolheu opção 2):</label>
+                        <textarea name="mensagem" rows="2" placeholder="Olá! Aqui é da secretaria acadêmica..."></textarea>
+
+                        <button type="submit" class="btn btn-teal">🚀 Enviar Mensagem Agora</button>
+                    </form>
+                </div>
+
+                <!-- COLUNA 2: ATENDIMENTOS HUMANOS EM ESPERA -->
+                <div class="card">
+                    <h2>👩‍💻 Atendimentos Humanos (Robô Pausado)</h2>
+                    <p style="font-size:13px; color:#64748b;">
+                        Quando um aluno digita <b>5</b> ou o atendente envia mensagem, o número aparece aqui e o robô fica em silêncio até clicar em <b>Reativar</b> (ou enviar <b>#finalizar</b> no WhatsApp).
+                    </p>
+
+                    <form method="POST" style="display:flex; gap:8px; margin-bottom:15px;">
+                        <input type="hidden" name="acao" value="pausar_robo">
+                        <input type="hidden" name="senha" class="campo-senha-oculto">
+                        <input type="text" name="num_pausar" placeholder="Pausar número (DDD + Num)" style="margin:0;">
+                        <button type="submit" class="btn btn-warning" style="white-space:nowrap;">⏸️ Pausar</button>
+                    </form>
+
+                    {% if pausados %}
+                        {% for num in pausados %}
+                            <div class="lista-item">
+                                <span>📱 <b>{{ num }}</b> (Em atendimento humano)</span>
+                                <form method="POST" style="margin:0;">
+                                    <input type="hidden" name="acao" value="reativar_robo">
+                                    <input type="hidden" name="senha" class="campo-senha-oculto">
+                                    <input type="hidden" name="num_target" value="{{ num }}">
+                                    <button type="submit" class="btn btn-success" style="padding:6px 12px; font-size:12px;">▶️ Devolver ao Robô</button>
+                                </form>
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <p style="text-align:center; color:#94a3b8; padding:20px 0;">Nenhum atendimento humano ativo no momento.</p>
+                    {% endif %}
+                </div>
+            </div>
         </div>
     </body>
     </html>
     """
-    return render_template_string(html, resultado=resultado, contatos=contatos_lista,
-                                  total_contatos=len(contatos_lista))
+    return render_template_string(
+        html,
+        alerta=alerta,
+        tipo_alerta=tipo_alerta,
+        instancia=INSTANCE_NAME,
+        status_conexao=status_conexao,
+        contatos=contatos_lista,
+        total_contatos=len(contatos_lista),
+        pausados=pausados_lista,
+        total_bloqueados=len(bloqueados_lista)
+    )
 
 
 @app.route("/metricas", methods=["GET"])
@@ -519,6 +698,20 @@ def baixar_metricas():
             download_name=f"relatorio_sofia_{datetime.now(FUSO_BR).strftime('%Y%m%d_%H%M')}.xlsx"
         )
     return jsonify({"erro": "Planilha não encontrada no servidor."}), 404
+
+
+@app.route("/status", methods=["GET"])
+def verificar_status():
+    try:
+        resp = requests.get(f"{EVOLUTION_API_URL}/instance/fetchInstances", headers={"apikey": API_KEY}, timeout=10)
+        return jsonify({
+            "servidor_flask": "ONLINE",
+            "instancia_configurada": INSTANCE_NAME,
+            "excel_encontrado": os.path.exists(EXCEL_FILE),
+            "instancias": resp.json()
+        }), 200
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
 
 
 @app.route("/webhook", methods=["POST"])
