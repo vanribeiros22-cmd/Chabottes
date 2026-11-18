@@ -10,7 +10,7 @@ app = Flask(__name__)
 # 1. CONFIGURAÇÕES DA EVOLUTION API E DO ARQUIVO DE DADOS (PRODUÇÃO)
 # ==============================================================================
 EVOLUTION_API_URL = "https://evolution-api-production-db931012.up.railway.app"
-INSTANCE_NAME = "sofia-oficial"  # <-- Confirma se este nome é IGUAL ao do painel Evolution!
+INSTANCE_NAME = "sofia-oficial"
 API_KEY = "cetrus2026teste"
 
 EXCEL_FILE = "diretorio_academico.xlsx"
@@ -23,6 +23,7 @@ pausa_memoria = set()
 # 2. FUNÇÕES AUXILIARES (NORMALIZAÇÃO, BLOQUEIO, PAUSA E MÉTRICAS)
 # ==============================================================================
 def normalizar_telefone(numero):
+    """Padroniza o número (DDD + últimos 8 dígitos) para evitar falhas do 9º dígito."""
     if not numero:
         return ""
     numero_str = str(numero).split("@")[0]
@@ -33,7 +34,9 @@ def normalizar_telefone(numero):
 
 
 def formatar_para_envio(numero):
-    apenas_digitos = "".join(filter(str.isdigit, str(numero)))
+    """Garante o DDI 55 para números brasileiros digitados manualmente."""
+    numero_str = str(numero).split("@")[0]
+    apenas_digitos = "".join(filter(str.isdigit, numero_str))
     if len(apenas_digitos) in [10, 11]:
         return "55" + apenas_digitos
     return apenas_digitos
@@ -41,6 +44,61 @@ def formatar_para_envio(numero):
 
 def agora_brasil():
     return datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
+
+
+def buscar_contatos_whatsapp():
+    """
+    Consulta a Evolution API para listar os contatos e chats já sincronizados
+    no WhatsApp oficial, ordenados por nome.
+    """
+    contatos_unicos = {}
+    headers = {"Content-Type": "application/json", "apikey": API_KEY}
+
+    # 1. Busca contatos salvos na agenda do WhatsApp
+    try:
+        resp_contacts = requests.post(
+            f"{EVOLUTION_API_URL}/chat/findContacts/{INSTANCE_NAME}",
+            json={},
+            headers=headers,
+            timeout=10
+        )
+        if resp_contacts.status_code == 200:
+            lista = resp_contacts.json()
+            if isinstance(lista, list):
+                for item in lista:
+                    jid = item.get("remoteJid") or item.get("id") or ""
+                    if "@s.whatsapp.net" in jid:
+                        num = jid.split("@")[0]
+                        nome = item.get("pushName") or item.get("name") or item.get("verifiedName") or num
+                        contatos_unicos[num] = f"{nome} ({num})"
+    except Exception as e:
+        print(f"[AVISO] Erro ao buscar findContacts: {e}")
+
+    # 2. Complementa com conversas recentes (chats) caso algum não tenha nome salvo
+    try:
+        resp_chats = requests.post(
+            f"{EVOLUTION_API_URL}/chat/findChats/{INSTANCE_NAME}",
+            json={},
+            headers=headers,
+            timeout=10
+        )
+        if resp_chats.status_code == 200:
+            chats = resp_chats.json()
+            if isinstance(chats, list):
+                for chat in chats:
+                    jid = chat.get("remoteJid") or chat.get("id") or ""
+                    if "@s.whatsapp.net" in jid:
+                        num = jid.split("@")[0]
+                        if num not in contatos_unicos:
+                            nome = chat.get("name") or chat.get("pushName") or num
+                            contatos_unicos[num] = f"{nome} ({num})"
+    except Exception as e:
+        print(f"[AVISO] Erro ao buscar findChats: {e}")
+
+    # Retorna lista ordenada alfabeticamente pelo rótulo
+    lista_ordenada = [{"numero": k, "rotulo": v} for k, v in contatos_unicos.items()]
+    lista_ordenada.sort(key=lambda x: x["rotulo"].lower())
+    return lista_ordenada
 
 
 def carregar_numeros_bloqueados():
@@ -323,7 +381,6 @@ def enviar_mensagem_whatsapp(numero_destino, texto_resposta):
 
 @app.route("/status", methods=["GET"])
 def verificar_status():
-    """Rota de diagnóstico para verificar a ligação entre o Flask e a Evolution API."""
     try:
         resp = requests.get(
             f"{EVOLUTION_API_URL}/instance/fetchInstances",
@@ -342,19 +399,28 @@ def verificar_status():
 
 @app.route("/iniciar", methods=["GET", "POST"])
 def iniciar_contato():
+    """
+    Painel web para iniciar contato com os contatos já salvos no WhatsApp
+    ou com um número digitado manualmente.
+    """
     resultado = ""
+    contatos_lista = buscar_contatos_whatsapp()
+
     if request.method == "POST":
         senha = request.form.get("senha", "")
-        numero = request.form.get("numero", "")
+        contato_selecionado = request.form.get("contato_salvo", "")
+        numero_manual = request.form.get("numero_manual", "")
         modo = request.form.get("modo", "menu")
         mensagem_custom = request.form.get("mensagem", "")
 
+        numero_final = numero_manual.strip() if numero_manual.strip() else contato_selecionado.strip()
+
         if senha != API_KEY:
             resultado = "❌ Chave de acesso incorreta."
-        elif not numero:
-            resultado = "❌ Por favor, digite o número com DDD."
+        elif not numero_final:
+            resultado = "❌ Selecione um contato da lista ou digite um número."
         else:
-            num_envio = formatar_para_envio(numero)
+            num_envio = formatar_para_envio(numero_final)
             num_norm = normalizar_telefone(num_envio)
 
             if modo == "menu":
@@ -369,7 +435,10 @@ def iniciar_contato():
                                   "Atendimento Humano Iniciado", "Em andamento")
 
             resp = enviar_mensagem_whatsapp(num_envio, texto_para_enviar)
-            resultado = f"Resultado do envio para {num_envio}: {resp}"
+            if resp and ("key" in str(resp) or "PENDING" in str(resp) or "status" in str(resp)):
+                resultado = f"✅ Mensagem enviada com sucesso para {num_envio}!"
+            else:
+                resultado = f"⚠️ Resposta da API: {resp}"
 
     html = """
     <!DOCTYPE html>
@@ -378,14 +447,26 @@ def iniciar_contato():
         <meta charset="UTF-8">
         <title>Iniciar Contato - Sofia Oficial</title>
         <style>
-            body { font-family: Arial, sans-serif; background: #f4f6f9; padding: 40px; }
-            .card { max-width: 480px; margin: auto; background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            body { font-family: Arial, sans-serif; background: #f4f6f9; padding: 30px; }
+            .card { max-width: 520px; margin: auto; background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
             h2 { color: #1e293b; margin-top: 0; }
             label { display: block; margin-top: 15px; font-weight: bold; color: #334155; }
             input, select, textarea { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #cbd5e1; border-radius: 6px; box-sizing: border-box; }
             button { margin-top: 20px; width: 100%; padding: 12px; background: #0f766e; color: white; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; }
-            .msg { margin-top: 15px; padding: 12px; border-radius: 6px; background: #e2e8f0; font-size: 13px; word-break: break-all; }
+            button:hover { background: #115e59; }
+            .msg { margin-top: 15px; padding: 12px; border-radius: 6px; background: #e2e8f0; font-size: 14px; word-break: break-all; }
+            .hint { font-size: 12px; color: #64748b; margin-top: 4px; }
         </style>
+        <script>
+            function filtrarContatos() {
+                var input = document.getElementById("filtro").value.toLowerCase();
+                var select = document.getElementById("contato_salvo");
+                for (var i = 0; i < select.options.length; i++) {
+                    var txt = select.options[i].text.toLowerCase();
+                    select.options[i].style.display = txt.includes(input) ? "" : "none";
+                }
+            }
+        </script>
     </head>
     <body>
         <div class="card">
@@ -393,15 +474,29 @@ def iniciar_contato():
             <form method="POST">
                 <label>Senha de Acesso (API Key):</label>
                 <input type="password" name="senha" placeholder="Digite a chave de acesso" required>
-                <label>Número do Aluno (com DDD):</label>
-                <input type="text" name="numero" placeholder="Ex: 11988887777" required>
+
+                <label>1. Buscar nos Contatos Salvos no WhatsApp ({{ total_contatos }}):</label>
+                <input type="text" id="filtro" onkeyup="filtrarContatos()" placeholder="🔍 Digite o nome ou número para filtrar...">
+                <select name="contato_salvo" id="contato_salvo">
+                    <option value="">-- Selecione um contato da agenda --</option>
+                    {% for c in contatos %}
+                        <option value="{{ c.numero }}">{{ c.rotulo }}</option>
+                    {% endfor %}
+                </select>
+
+                <label>OU Digite um Número Novo (com DDD):</label>
+                <input type="text" name="numero_manual" placeholder="Ex: 11988887777 (deixe vazio se escolheu acima)">
+                <div class="hint">Se preencher aqui, este número terá prioridade sobre a lista acima.</div>
+
                 <label>Como deseja iniciar?</label>
                 <select name="modo">
                     <option value="menu">1. Enviar Menu Automático da Sofia</option>
                     <option value="humano">2. Mensagem Manual (Pausar o Robô)</option>
                 </select>
+
                 <label>Mensagem Personalizada (se escolheu opção 2):</label>
                 <textarea name="mensagem" rows="3" placeholder="Olá! Aqui é da secretaria acadêmica..."></textarea>
+
                 <button type="submit">Enviar Mensagem Agora</button>
             </form>
             {% if resultado %}
@@ -411,7 +506,8 @@ def iniciar_contato():
     </body>
     </html>
     """
-    return render_template_string(html, resultado=resultado)
+    return render_template_string(html, resultado=resultado, contatos=contatos_lista,
+                                  total_contatos=len(contatos_lista))
 
 
 @app.route("/metricas", methods=["GET"])
