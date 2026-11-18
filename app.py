@@ -46,20 +46,38 @@ def agora_brasil():
 
 
 def configurar_webhook_automatico():
+    """
+    Configura o webhook na Evolution API utilizando o formato correto exigido
+    pela v2 (encapsulado na chave 'webhook').
+    """
     headers = {"Content-Type": "application/json", "apikey": API_KEY}
+
+    # Formato correto exigido pela Evolution API v2 (conforme o erro retornado)
     payload = {
-        "enabled": True,
-        "url": WEBHOOK_PUBLIC_URL,
-        "webhookByEvents": False,
-        "events": ["MESSAGES_UPSERT", "SEND_MESSAGE"]
+        "webhook": {
+            "enabled": True,
+            "url": WEBHOOK_PUBLIC_URL,
+            "webhookByEvents": False,
+            "webhookBase64": False,
+            "events": [
+                "MESSAGES_UPSERT",
+                "SEND_MESSAGE"
+            ]
+        }
     }
+
     try:
-        r = requests.post(f"{EVOLUTION_API_URL}/webhook/set/{INSTANCE_NAME}", json=payload, headers=headers, timeout=10)
+        r = requests.post(
+            f"{EVOLUTION_API_URL}/webhook/set/{INSTANCE_NAME}",
+            json=payload,
+            headers=headers,
+            timeout=10
+        )
         if r.status_code in [200, 201]:
-            return True, "Webhook ativado com sucesso!"
+            return True, "Webhook ativado com sucesso para a instância oficial!"
         return False, f"Erro HTTP {r.status_code}: {r.text}"
     except Exception as e:
-        return False, f"Falha de conexão: {str(e)}"
+        return False, f"Falha de conexão com Evolution API: {str(e)}"
 
 
 def buscar_contatos_whatsapp():
@@ -98,7 +116,6 @@ def buscar_contatos_whatsapp():
 
 
 def buscar_mensagens_recentes():
-    """Busca as últimas conversas/mensagens gravadas nas métricas do Excel para exibição rápida."""
     try:
         if not os.path.exists(EXCEL_FILE):
             return []
@@ -107,12 +124,11 @@ def buscar_mensagens_recentes():
         df = todas_abas.get(nome_aba, pd.DataFrame())
         if df.empty:
             return []
-        # Retorna as últimas 10 interações em ordem decrescente
         ultimas = df.tail(10).to_dict(orient="records")
         ultimas.reverse()
         return ultimas
     except Exception as e:
-        print(f"[AVISO] Erro ao buscar historico: {e}")
+        print(f"[AVISO] Erro historico: {e}")
         return []
 
 
@@ -259,9 +275,7 @@ def consultar_excel(pergunta, numero_aluno_norm):
                 gerenciar_estado_humano(numero_aluno_norm, acao="ativar")
                 registrar_metrica(numero_aluno_norm, "Atendimento Humano", "Transbordo", pergunta,
                                   "Transferido para Humano", "Em andamento")
-                filtrado_5 = df_faq[df_faq['Numero_Menu'] == 5.0]
-                msg = "👩‍💻 *Transferindo para o Atendimento Humano...*\n\nAguarde um momento, já vamos falar com você.\n\n_(O robô ficará pausado durante este atendimento)_"
-                return msg
+                return "👩‍💻 *Transferindo para o Atendimento Humano...*\n\nAguarde um momento, já vamos falar com você.\n\n_(O robô ficará pausado durante este atendimento)_"
 
             filtrado = df_faq[df_faq['Numero_Menu'] == num_opcao]
             if not filtrado.empty:
