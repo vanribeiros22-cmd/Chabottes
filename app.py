@@ -14,18 +14,24 @@ import requests
 
 app = Flask(__name__)
 
+# ==========================================
+# CONFIGURAÇÕES GERAIS E EVOLUTION API
+# ==========================================
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "sofia-oficial-cetrus-2026-chave-fixa")
 CHAVE_ACESSO_PADRAO = os.environ.get("CHAVE_ACESSO", "cetrus2026teste")
 
-# Configurações da API do WhatsApp (configure no Railway ou .env)
-WHATSAPP_API_URL = os.environ.get("WHATSAPP_API_URL", "").rstrip("/")
-WHATSAPP_API_KEY = os.environ.get("WHATSAPP_API_KEY", "")
-INSTANCIA_NOME = os.environ.get("WHATSAPP_INSTANCE", "sofia-oficial")
+# URL e Chave da Evolution API (configure também nas Variables do Railway)
+WHATSAPP_API_URL = os.environ.get(
+    "WHATSAPP_API_URL", "https://evolution-api-production-db931012.up.railway.app"
+).rstrip("/")
+WHATSAPP_API_KEY = os.environ.get("WHATSAPP_API_KEY", "").strip()
+INSTANCIA_NOME = os.environ.get("WHATSAPP_INSTANCE", "sofia-oficial").strip()
 BLOQUEADOS_COUNT = int(os.environ.get("BLOQUEADOS_COUNT", "7"))
 STATUS_WHATSAPP = os.environ.get("STATUS_WHATSAPP", "open")
 
 ARQUIVO_CONTATOS = os.path.join(os.path.dirname(__file__), "diretorio_academico.xlsx")
 
+# Mantém a sessão ativa por 30 dias para não pedir senha toda hora
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
@@ -35,8 +41,13 @@ MENSAGEM_ENCERRAMENTO = (
     "Se precisar de algo, é só enviar uma nova mensagem a qualquer momento"
 )
 
+# Armazenamento em memória das conversas ativas
 conversas = {}
 
+
+# ==========================================
+# FUNÇÕES AUXILIARES E SEGURANÇA DE DADOS
+# ==========================================
 
 def normalizar_telefone(telefone: str) -> str:
     numeros = re.sub(r"\D", "", str(telefone or ""))
@@ -52,16 +63,41 @@ def normalizar_texto(texto: str) -> str:
     return str(texto).replace("\\n", "\n").strip()
 
 
-def carregar_contatos_excel() -> list[dict]:
+def eh_mensagem_encerramento(texto: str) -> bool:
+    limpo = re.sub(r"\s+", " ", normalizar_texto(texto)).lower()
+    alvo = re.sub(r"\s+", " ", MENSAGEM_ENCERRAMENTO).lower()
+    return (
+        limpo == alvo
+        or limpo == "#finalizar"
+        or "atendimento encerrado. obrigado pelo contato!" in limpo
+    )
+
+
+def converter_numero_seguro(texto: str):
+    """Evita 'could not convert string to float' ao receber frases ou textos livres."""
+    limpo = normalizar_texto(texto).replace(",", ".")
+    try:
+        return float(limpo)
+    except (ValueError, TypeError):
+        return None
+
+
+def carregar_contatos_excel() -> list:
     """Lê os contatos de diretorio_academico.xlsx, com fallback seguro."""
     contatos = []
     if os.path.exists(ARQUIVO_CONTATOS):
         try:
             df = pd.read_excel(ARQUIVO_CONTATOS)
             for _, row in df.iterrows():
-                nome = str(row.get("nome") or row.get("Nome") or row.get("aluno") or "Contato").strip()
+                nome = str(
+                    row.get("nome") or row.get("Nome") or row.get("aluno") or "Contato"
+                ).strip()
                 tel = normalizar_telefone(
-                    row.get("telefone") or row.get("Telefone") or row.get("celular") or row.get("numero") or ""
+                    row.get("telefone")
+                    or row.get("Telefone")
+                    or row.get("celular")
+                    or row.get("numero")
+                    or ""
                 )
                 if tel:
                     contatos.append({"nome": nome, "telefone": tel})
@@ -74,61 +110,6 @@ def carregar_contatos_excel() -> list[dict]:
             {"nome": "Aluno Teste Secretaria", "telefone": "5511957735761"},
         ]
     return contatos
-
-
-def enviar_whatsapp_api(telefone: str, texto: str) -> tuple[bool, str]:
-    """
-    Envia mensagem real para a API do WhatsApp.
-    Ajuste o endpoint/payload conforme o provedor usado na instância sofia-oficial.
-    """
-    tel = normalizar_telefone(telefone)
-    msg = normalizar_texto(texto)
-
-    if not tel or not msg:
-        return False, "Telefone ou mensagem vazios."
-
-    if not WHATSAPP_API_URL or not WHATSAPP_API_KEY:
-        return False, (
-            "API do WhatsApp não configurada no servidor. "
-            "Defina WHATSAPP_API_URL e WHATSAPP_API_KEY nas variáveis de ambiente."
-        )
-
-    url = f"{WHATSAPP_API_URL}/message/sendText/{INSTANCIA_NOME}"
-    headers = {
-        "Content-Type": "application/json",
-        "apikey": WHATSAPP_API_KEY,
-        "Authorization": f"Bearer {WHATSAPP_API_KEY}",
-    }
-    payload = {
-        "number": tel,
-        "text": msg,
-    }
-
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=15)
-        if 200 <= resp.status_code < 300:
-            return True, "Mensagem enviada com sucesso."
-        return False, f"Falha na API WhatsApp (HTTP {resp.status_code}): {resp.text[:200]}"
-    except Exception as exc:
-        return False, f"Erro de conexão com a API WhatsApp: {exc}"
-
-
-def eh_mensagem_encerramento(texto: str) -> bool:
-    limpo = re.sub(r"\s+", " ", normalizar_texto(texto)).lower()
-    alvo = re.sub(r"\s+", " ", MENSAGEM_ENCERRAMENTO).lower()
-    return (
-        limpo == alvo
-        or limpo == "#finalizar"
-        or "atendimento encerrado. obrigado pelo contato!" in limpo
-    )
-
-
-def converter_numero_seguro(texto: str):
-    limpo = normalizar_texto(texto).replace(",", ".")
-    try:
-        return float(limpo)
-    except (ValueError, TypeError):
-        return None
 
 
 def obter_conversa(telefone: str) -> dict:
@@ -152,12 +133,88 @@ def pausar_para_humano(telefone: str) -> dict:
 
 
 def reativar_robo(telefone: str) -> dict:
+    """Reativa o robô automaticamente e reseta a etapa para o início."""
     conv = obter_conversa(telefone)
     conv["robo_pausado"] = False
     conv["etapa"] = "menu_inicial"
     conv["atualizado_em"] = datetime.now().strftime("%d/%m/%Y %H:%M")
     return conv
 
+
+# ==========================================
+# INTEGRAÇÃO EVOLUTION API (ENVIO E WEBHOOK)
+# ==========================================
+
+def extrair_dados_evolution(dados: dict) -> tuple:
+    """Extrai (telefone, mensagem, from_me) do payload da Evolution API."""
+    if "data" in dados and isinstance(dados["data"], dict):
+        data = dados["data"]
+        key = data.get("key") or {}
+        msg_obj = data.get("message") or {}
+
+        remote_jid = str(key.get("remoteJid") or "")
+        # Ignora mensagens de grupo (@g.us) ou status
+        if "@g.us" in remote_jid or "status@broadcast" in remote_jid:
+            return "", "", False
+
+        telefone = normalizar_telefone(remote_jid.split("@")[0])
+        from_me = bool(key.get("fromMe", False))
+
+        texto = (
+            msg_obj.get("conversation")
+            or (msg_obj.get("extendedTextMessage") or {}).get("text")
+            or (msg_obj.get("buttonsResponseMessage") or {}).get("selectedDisplayText")
+            or (msg_obj.get("listResponseMessage") or {}).get("title")
+            or ""
+        )
+        return telefone, normalizar_texto(texto), from_me
+
+    telefone = normalizar_telefone(
+        dados.get("telefone") or dados.get("from") or dados.get("remoteJid") or ""
+    )
+    mensagem = normalizar_texto(
+        dados.get("mensagem") or dados.get("body") or dados.get("text") or ""
+    )
+    from_me = bool(dados.get("fromMe", False))
+    return telefone, mensagem, from_me
+
+
+def enviar_whatsapp_api(telefone: str, texto: str) -> tuple:
+    """Envia mensagem de texto real para a instância sofia-oficial na Evolution API."""
+    tel = normalizar_telefone(telefone)
+    msg = normalizar_texto(texto)
+
+    if not tel or not msg:
+        return False, "Telefone ou mensagem vazios."
+
+    if not WHATSAPP_API_URL or not WHATSAPP_API_KEY:
+        return False, (
+            "Configure WHATSAPP_API_KEY nas variáveis de ambiente do Railway "
+            "(com a API Key da Evolution API)."
+        )
+
+    url = f"{WHATSAPP_API_URL}/message/sendText/{INSTANCIA_NOME}"
+    headers = {
+        "Content-Type": "application/json",
+        "apikey": WHATSAPP_API_KEY,
+    }
+    payload = {
+        "number": tel,
+        "text": msg,
+    }
+
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        if 200 <= resp.status_code < 300:
+            return True, f"Mensagem enviada com sucesso para {tel}."
+        return False, f"Evolution API retornou HTTP {resp.status_code}: {resp.text[:200]}"
+    except Exception as exc:
+        return False, f"Erro ao conectar na Evolution API: {exc}"
+
+
+# ==========================================
+# AUTENTICAÇÃO DO PAINEL (CHAVE PERSISTENTE)
+# ==========================================
 
 def chave_valida(req) -> bool:
     if session.get("chave_liberada") is True:
@@ -188,6 +245,10 @@ def exigir_chave(f):
 
     return wrapper
 
+
+# ==========================================
+# FLUXO DE RESPOSTAS DA SOFIA
+# ==========================================
 
 def menu_sofia_texto() -> str:
     return (
@@ -234,6 +295,10 @@ def responder_bot(telefone: str, mensagem: str) -> str:
         "• Digite *0* para encerrar"
     )
 
+
+# ==========================================
+# ROTAS WEB E API DO PAINEL
+# ==========================================
 
 @app.route("/")
 def index():
@@ -495,7 +560,33 @@ def index():
 @app.route("/api/webhook/corrigir", methods=["POST"])
 @exigir_chave
 def corrigir_webhook():
-    return jsonify({"ok": True, "mensagem": "Webhook oficial verificado e ativo."})
+    if not WHATSAPP_API_URL or not WHATSAPP_API_KEY:
+        return jsonify({
+            "ok": False,
+            "mensagem": "Defina WHATSAPP_API_KEY nas variáveis do Railway antes de configurar o webhook."
+        }), 400
+
+    webhook_url = request.url_root.rstrip("/") + "/webhook"
+    url = f"{WHATSAPP_API_URL}/webhook/set/{INSTANCIA_NOME}"
+    headers = {"Content-Type": "application/json", "apikey": WHATSAPP_API_KEY}
+    payload = {
+        "webhook": {
+            "enabled": True,
+            "url": webhook_url,
+            "webhookByEvents": False,
+            "events": ["MESSAGES_UPSERT"],
+        }
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        if 200 <= resp.status_code < 300:
+            return jsonify({"ok": True, "mensagem": f"Webhook oficial ativado em {webhook_url}."})
+        return jsonify({
+            "ok": False,
+            "mensagem": f"Erro ao configurar webhook na Evolution API (HTTP {resp.status_code}): {resp.text[:180]}"
+        }), 500
+    except Exception as exc:
+        return jsonify({"ok": False, "mensagem": f"Falha de conexão com Evolution API: {exc}"}), 500
 
 
 @app.route("/api/metricas/xlsx", methods=["POST"])
@@ -573,17 +664,12 @@ def api_reativar():
 @app.route("/webhook", methods=["POST"])
 def webhook_whatsapp():
     dados = request.get_json(silent=True) or {}
-    telefone = normalizar_telefone(
-        dados.get("telefone") or dados.get("from") or dados.get("remoteJid") or ""
-    )
-    mensagem = normalizar_texto(
-        dados.get("mensagem") or dados.get("body") or dados.get("text") or ""
-    )
-    from_me = bool(dados.get("fromMe", False))
+    telefone, mensagem, from_me = extrair_dados_evolution(dados)
 
     if not telefone or not mensagem:
         return jsonify({"status": "ignorado"}), 200
 
+    # Mensagens enviadas pelo número da secretaria (fromMe == True)
     if from_me:
         if eh_mensagem_encerramento(mensagem):
             reativar_robo(telefone)
@@ -593,6 +679,7 @@ def webhook_whatsapp():
             return jsonify({"status": "pausado_por_humano", "telefone": telefone}), 200
         return jsonify({"status": "mensagem_bot"}), 200
 
+    # Mensagens recebidas do aluno
     conv = obter_conversa(telefone)
     if mensagem.lower() in ("#finalizar", "0", "encerrar"):
         resposta = responder_bot(telefone, mensagem)
@@ -608,7 +695,11 @@ def webhook_whatsapp():
         return jsonify({"status": "respondido", "telefone": telefone, "resposta": resposta}), 200
     except Exception as exc:
         print(f"[ERRO BOT] {telefone}: {exc}")
-        fallback = "Desculpe, não encontrei essa opção. 🤔\n\n• Digite *menu* para ver as opções\n• Digite *0* para encerrar"
+        fallback = (
+            "Desculpe, não encontrei essa opção. 🤔\n\n"
+            "• Digite *menu* para ver as opções\n"
+            "• Digite *0* para encerrar"
+        )
         enviar_whatsapp_api(telefone, fallback)
         return jsonify({"status": "erro_tratado", "telefone": telefone, "resposta": fallback}), 200
 
