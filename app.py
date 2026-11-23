@@ -1,8 +1,8 @@
 import io
 import os
-import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
+
 from flask import (
     Flask,
     jsonify,
@@ -16,807 +16,973 @@ import requests
 
 app = Flask(__name__)
 
-# ==========================================
-# CONFIGURAÇÕES GERAIS E EVOLUTION API
-# ==========================================
+# ==============================================================================
+# 1. CONFIGURAÇÕES DA EVOLUTION API E DO ARQUIVO DE DADOS (PRODUÇÃO)
+# ==============================================================================
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "sofia-oficial-cetrus-2026-chave-fixa")
-CHAVE_ACESSO_PADRAO = "cetrus2026teste"
-
-WHATSAPP_API_URL = os.environ.get(
-    "WHATSAPP_API_URL", "https://evolution-api-production-db931012.up.railway.app"
-).rstrip("/")
-WHATSAPP_API_KEY = os.environ.get("WHATSAPP_API_KEY", "").strip()
-INSTANCIA_NOME = os.environ.get("WHATSAPP_INSTANCE", "sofia-oficial").strip()
-STATUS_WHATSAPP = os.environ.get("STATUS_WHATSAPP", "open")
-
-ARQUIVO_PLANILHA = os.path.join(os.path.dirname(__file__), "diretorio_academico.xlsx")
-
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+EVOLUTION_API_URL = os.environ.get(
+    "EVOLUTION_API_URL", "https://evolution-api-production-db931012.up.railway.app"
+).rstrip("/")
+INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "sofia-oficial").strip()
+API_KEY = os.environ.get("API_KEY", "cetrus2026teste").strip()
+EVOLUTION_API_KEY = os.environ.get("EVOLUTION_API_KEY", API_KEY).strip()
+WEBHOOK_PUBLIC_URL = os.environ.get(
+    "WEBHOOK_PUBLIC_URL", "https://chattest-production-37ef5795.up.railway.app/webhook"
+).strip()
+
+EXCEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diretorio_academico.xlsx")
+FUSO_BR = timezone(timedelta(hours=-3))
 
 MENSAGEM_ENCERRAMENTO = (
     "Atendimento encerrado. Obrigado pelo contato! 💙\n\n"
     "Se precisar de algo, é só enviar uma nova mensagem a qualquer momento"
 )
 
-conversas = {}
-metricas_log = []
+pausa_memoria = set()
 
 
-# ==========================================
-# NORMALIZAÇÃO E PROTEÇÃO CONTRA ERROS
-# ==========================================
+# ==============================================================================
+# 2. FUNÇÕES AUXILIARES (NORMALIZAÇÃO, BLOQUEIO, PAUSA E MÉTRICAS)
+# ==============================================================================
 
-def normalizar_telefone(telefone: str) -> str:
-    numeros = re.sub(r"\D", "", str(telefone or ""))
-    if not numeros:
+def normalizar_telefone(numero):
+    if not numero:
         return ""
-    # Normaliza DDD + 8 dígitos (10 dígitos) ou DDD + 9 dígitos (11 dígitos) com DDI 55
-    if len(numeros) in (10, 11):
-        numeros = "55" + numeros
-    return numeros
+    numero_str = str(numero).split("@")[0]
+    apenas_digitos = "".join(filter(str.isdigit, numero_str))
+    if len(apenas_digitos) >= 10:
+        return apenas_digitos[-10:]
+    return apenas_digitos
 
 
-def normalizar_texto(texto: str) -> str:
-    if not texto:
-        return ""
-    return str(texto).replace("\\n", "\n").strip()
+def formatar_para_envio(numero):
+    numero_str = str(numero).split("@")[0]
+    apenas_digitos = "".join(filter(str.isdigit, numero_str))
+    if len(apenas_digitos) in [10, 11]:
+        return "55" + apenas_digitos
+    return apenas_digitos
 
 
-def eh_mensagem_encerramento(texto: str) -> bool:
-    limpo = re.sub(r"\s+", " ", normalizar_texto(texto)).lower()
-    alvo = re.sub(r"\s+", " ", MENSAGEM_ENCERRAMENTO).lower()
-    return (
-        limpo == alvo
-        or limpo == "#finalizar"
-        or "atendimento encerrado. obrigado pelo contato!" in limpo
-    )
+def agora_brasil():
+    return datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
 
 
-def converter_numero_seguro(texto: str):
-    """Evita 'could not convert string to float' em frases ou textos livres."""
-    limpo = normalizar_texto(texto).replace(",", ".")
+def converter_numero_seguro(valor):
+    """Evita 'could not convert string to float' quando recebe texto livre."""
+    if valor is None:
+        return None
+    texto = str(valor).strip().replace(",", ".")
     try:
-        return float(limpo)
+        return float(texto)
     except (ValueError, TypeError):
         return None
 
 
-# ==========================================
-# PLANILHA EXCEL (CONTATOS, BLOQUEADOS E MÉTRICAS)
-# ==========================================
-
-def carregar_bloqueados_excel() -> set:
-    bloqueados = set()
-    if not os.path.exists(ARQUIVO_PLANILHA):
-        return bloqueados
-    try:
-        xls = pd.ExcelFile(ARQUIVO_PLANILHA)
-        if "TelefoneContatos_Bloqueados" in xls.sheet_names:
-            df_bloq = pd.read_excel(ARQUIVO_PLANILHA, sheet_name="TelefoneContatos_Bloqueados")
-            for _, row in df_bloq.iterrows():
-                for val in row.values:
-                    tel = normalizar_telefone(val)
-                    if len(tel) >= 12:
-                        bloqueados.add(tel)
-    except Exception as exc:
-        print(f"[AVISO BLOQUEADOS] {exc}")
-    return bloqueados
-
-
-def carregar_contatos_excel() -> list:
-    contatos = []
-    if os.path.exists(ARQUIVO_PLANILHA):
-        try:
-            df = pd.read_excel(ARQUIVO_PLANILHA)
-            for _, row in df.iterrows():
-                nome = str(
-                    row.get("nome") or row.get("Nome") or row.get("aluno") or row.get("Aluno") or "Contato"
-                ).strip()
-                tel = normalizar_telefone(
-                    row.get("telefone")
-                    or row.get("Telefone")
-                    or row.get("celular")
-                    or row.get("Celular")
-                    or row.get("numero")
-                    or ""
-                )
-                if tel:
-                    contatos.append({"nome": nome, "telefone": tel})
-        except Exception as exc:
-            print(f"[AVISO CONTATOS EXCEL] {exc}")
-
-    if not contatos:
-        contatos = [
-            {"nome": "Mayara Cetrus Semi", "telefone": "5511999990001"},
-            {"nome": "Aluno Teste Secretaria", "telefone": "5511957735761"},
-        ]
-    return contatos
-
-
-def buscar_contatos_evolution() -> list:
-    if not WHATSAPP_API_URL or not WHATSAPP_API_KEY:
-        return []
-    url = f"{WHATSAPP_API_URL}/chat/findContacts/{INSTANCIA_NOME}"
-    headers = {"Content-Type": "application/json", "apikey": WHATSAPP_API_KEY}
-    encontrados = []
-    try:
-        resp = requests.post(url, json={}, headers=headers, timeout=12)
-        if 200 <= resp.status_code < 300:
-            data = resp.json()
-            lista = data if isinstance(data, list) else data.get("data") or data.get("contacts") or []
-            for item in lista:
-                if not isinstance(item, dict):
-                    continue
-                jid = str(item.get("remoteJid") or item.get("id") or "")
-                if "@g.us" in jid:
-                    continue
-                tel = normalizar_telefone(jid.split("@")[0] or item.get("number") or "")
-                nome = str(item.get("pushName") or item.get("name") or tel).strip()
-                if tel:
-                    encontrados.append({"nome": nome, "telefone": tel})
-    except Exception as exc:
-        print(f"[AVISO CONTATOS EVOLUTION] {exc}")
-    return encontrados
-
-
-def obter_lista_contatos_combinada() -> list:
-    combinados = {}
-    for c in carregar_contatos_excel():
-        combinados[c["telefone"]] = c
-    for c in buscar_contatos_evolution():
-        if c["telefone"] not in combinados:
-            combinados[c["telefone"]] = c
-    return list(combinados.values())
-
-
-def registrar_metrica(telefone: str, evento: str, detalhe: str = ""):
-    metricas_log.append({
-        "data_hora": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "telefone": normalizar_telefone(telefone),
-        "evento": evento,
-        "detalhe": detalhe,
-    })
-
-
-def gerar_arquivo_metricas_xlsx() -> io.BytesIO:
-    output = io.BytesIO()
-    bloqueados = sorted(list(carregar_bloqueados_excel()))
-    df_metricas = pd.DataFrame(
-        metricas_log if metricas_log else [{"data_hora": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "telefone": "-", "evento": "SEM_REGISTROS", "detalhe": "Nenhum atendimento registrado ainda."}]
+def eh_mensagem_encerramento(texto):
+    if not texto:
+        return False
+    limpo = " ".join(str(texto).replace("\\n", "\n").lower().split())
+    alvo = " ".join(MENSAGEM_ENCERRAMENTO.lower().split())
+    return (
+        limpo == alvo
+        or limpo.strip() == "#finalizar"
+        or "atendimento encerrado. obrigado pelo contato!" in limpo
     )
-    df_bloq = pd.DataFrame({"telefone_bloqueado": bloqueados})
-
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df_metricas.to_excel(writer, sheet_name="Metricas_Atendimentos", index=False)
-        df_bloq.to_excel(writer, sheet_name="TelefoneContatos_Bloqueados", index=False)
-
-    output.seek(0)
-    return output
 
 
-# ==========================================
-# ESTADO DO ROBÔ E PAUSA HUMANA
-# ==========================================
-
-def obter_conversa(telefone: str) -> dict:
-    tel = normalizar_telefone(telefone)
-    if tel not in conversas:
-        conversas[tel] = {
-            "telefone": tel,
-            "robo_pausado": False,
-            "etapa": "menu_inicial",
-            "atualizado_em": datetime.now().strftime("%d/%m/%Y %H:%M"),
-        }
-    return conversas[tel]
-
-
-def pausar_para_humano(telefone: str, motivo: str = "intervencao_humana") -> dict:
-    conv = obter_conversa(telefone)
-    conv["robo_pausado"] = True
-    conv["etapa"] = "atendimento_humano"
-    conv["atualizado_em"] = datetime.now().strftime("%d/%m/%Y %H:%M")
-    registrar_metrica(telefone, "PAUSADO_HUMANO", motivo)
-    return conv
-
-
-def reativar_robo(telefone: str, motivo: str = "encerramento_ou_reativacao") -> dict:
-    conv = obter_conversa(telefone)
-    conv["robo_pausado"] = False
-    conv["etapa"] = "menu_inicial"
-    conv["atualizado_em"] = datetime.now().strftime("%d/%m/%Y %H:%M")
-    registrar_metrica(telefone, "REATIVADO_ROBO", motivo)
-    return conv
-
-
-# ==========================================
-# EVOLUTION API (ENVIO E WEBHOOK)
-# ==========================================
-
-def extrair_dados_evolution(dados: dict) -> tuple:
-    if "data" in dados and isinstance(dados["data"], dict):
-        data = dados["data"]
-        key = data.get("key") or {}
-        msg_obj = data.get("message") or {}
-
-        remote_jid = str(key.get("remoteJid") or "")
-        if "@g.us" in remote_jid or "status@broadcast" in remote_jid:
-            return "", "", False
-
-        telefone = normalizar_telefone(remote_jid.split("@")[0])
-        from_me = bool(key.get("fromMe", False))
-
-        texto = (
-            msg_obj.get("conversation")
-            or (msg_obj.get("extendedTextMessage") or {}).get("text")
-            or (msg_obj.get("buttonsResponseMessage") or {}).get("selectedDisplayText")
-            or (msg_obj.get("listResponseMessage") or {}).get("title")
-            or ""
-        )
-        return telefone, normalizar_texto(texto), from_me
-
-    telefone = normalizar_telefone(
-        dados.get("telefone") or dados.get("from") or dados.get("remoteJid") or ""
-    )
-    mensagem = normalizar_texto(
-        dados.get("mensagem") or dados.get("body") or dados.get("text") or ""
-    )
-    from_me = bool(dados.get("fromMe", False))
-    return telefone, mensagem, from_me
-
-
-def enviar_whatsapp_api(telefone: str, texto: str) -> tuple:
-    tel = normalizar_telefone(telefone)
-    msg = normalizar_texto(texto)
-
-    if not tel or not msg:
-        return False, "Telefone ou mensagem vazios."
-
-    if not WHATSAPP_API_URL or not WHATSAPP_API_KEY:
-        return False, (
-            "Defina WHATSAPP_API_KEY nas variáveis do Railway antes de enviar ou configurar o webhook."
-        )
-
-    url = f"{WHATSAPP_API_URL}/message/sendText/{INSTANCIA_NOME}"
-    headers = {"Content-Type": "application/json", "apikey": WHATSAPP_API_KEY}
-    payload = {"number": tel, "text": msg}
-
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=15)
-        if 200 <= resp.status_code < 300:
-            registrar_metrica(tel, "MENSAGEM_ENVIADA", msg[:80])
-            return True, f"Mensagem enviada com sucesso para {tel}."
-        return False, f"Evolution API retornou HTTP {resp.status_code}: {resp.text[:180]}"
-    except Exception as exc:
-        return False, f"Erro ao conectar na Evolution API: {exc}"
-
-
-# ==========================================
-# AUTENTICAÇÃO PERSISTENTE
-# ==========================================
-
-def chave_valida(req) -> bool:
-    if session.get("chave_liberada") is True:
+def chave_autenticada(req):
+    if session.get("sofia_autenticada") is True:
         session.permanent = True
         return True
-
-    chave = (
-        req.headers.get("X-Access-Key")
-        or req.form.get("chave_acesso")
-        or (req.get_json(silent=True) or {}).get("chave_acesso")
-        or req.args.get("chave_acesso")
+    senha = (
+        req.form.get("senha")
+        or (req.get_json(silent=True) or {}).get("senha")
+        or req.args.get("senha")
         or ""
     ).strip()
-
-    if chave == CHAVE_ACESSO_PADRAO:
+    if senha == API_KEY:
         session.permanent = True
-        session["chave_liberada"] = True
+        session["sofia_autenticada"] = True
         return True
     return False
 
 
-def exigir_chave(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        if not chave_valida(request):
-            return jsonify({"ok": False, "mensagem": "Chave de acesso inválida."}), 401
-        return f(*args, **kwargs)
+def configurar_webhook_automatico():
+    """
+    Configura automaticamente o Webhook na Evolution API para a instância oficial,
+    garantindo que MESSAGES_UPSERT e SEND_MESSAGE estejam ativos.
+    """
+    headers = {"Content-Type": "application/json", "apikey": EVOLUTION_API_KEY}
+    payload_v2 = {
+        "webhook": {
+            "enabled": True,
+            "url": WEBHOOK_PUBLIC_URL,
+            "webhookByEvents": False,
+            "webhookBase64": False,
+            "events": ["MESSAGES_UPSERT", "SEND_MESSAGE"],
+        }
+    }
+    try:
+        r = requests.post(
+            f"{EVOLUTION_API_URL}/webhook/set/{INSTANCE_NAME}",
+            json=payload_v2,
+            headers=headers,
+            timeout=10,
+        )
+        if r.status_code in [200, 201]:
+            return True, f"Webhook ativado com sucesso para {INSTANCE_NAME}!"
 
-    return wrapper
+        payload_plano = {
+            "enabled": True,
+            "url": WEBHOOK_PUBLIC_URL,
+            "webhookByEvents": False,
+            "events": ["MESSAGES_UPSERT", "SEND_MESSAGE"],
+        }
+        r2 = requests.post(
+            f"{EVOLUTION_API_URL}/webhook/set/{INSTANCE_NAME}",
+            json=payload_plano,
+            headers=headers,
+            timeout=10,
+        )
+        if r2.status_code in [200, 201]:
+            return True, f"Webhook ativado com sucesso para {INSTANCE_NAME}!"
+        return False, f"Erro HTTP {r.status_code}: {r.text}"
+    except Exception as e:
+        return False, f"Falha de conexão com Evolution API: {str(e)}"
 
 
-# ==========================================
-# FLUXO DE RESPOSTAS DA SOFIA
-# ==========================================
+def buscar_contatos_whatsapp():
+    """Consulta a Evolution API para listar contatos e chats sincronizados."""
+    contatos_unicos = {}
+    headers = {"Content-Type": "application/json", "apikey": EVOLUTION_API_KEY}
 
-def menu_sofia_texto() -> str:
-    return (
-        "Olá! Sou a *Sofia*, assistente acadêmica.\n\n"
-        "1 - Provas e Avaliações\n"
-        "2 - Calendário de Aulas\n"
-        "3 - Secretaria Acadêmica\n"
-        "5 - Falar com Atendente\n"
-        "0 - Encerrar"
+    try:
+        resp_contacts = requests.post(
+            f"{EVOLUTION_API_URL}/chat/findContacts/{INSTANCE_NAME}",
+            json={},
+            headers=headers,
+            timeout=8,
+        )
+        if resp_contacts.status_code == 200:
+            lista = resp_contacts.json()
+            if isinstance(lista, list):
+                for item in lista:
+                    jid = item.get("remoteJid") or item.get("id") or ""
+                    if "@s.whatsapp.net" in jid:
+                        num = jid.split("@")[0]
+                        nome = (
+                            item.get("pushName")
+                            or item.get("name")
+                            or item.get("verifiedName")
+                            or num
+                        )
+                        contatos_unicos[num] = f"{nome} ({num})"
+    except Exception as e:
+        print(f"[AVISO] Erro findContacts: {e}")
+
+    try:
+        resp_chats = requests.post(
+            f"{EVOLUTION_API_URL}/chat/findChats/{INSTANCE_NAME}",
+            json={},
+            headers=headers,
+            timeout=8,
+        )
+        if resp_chats.status_code == 200:
+            chats = resp_chats.json()
+            if isinstance(chats, list):
+                for chat in chats:
+                    jid = chat.get("remoteJid") or chat.get("id") or ""
+                    if "@s.whatsapp.net" in jid:
+                        num = jid.split("@")[0]
+                        if num not in contatos_unicos:
+                            nome = chat.get("name") or chat.get("pushName") or num
+                            contatos_unicos[num] = f"{nome} ({num})"
+    except Exception as e:
+        print(f"[AVISO] Erro findChats: {e}")
+
+    lista_ordenada = [{"numero": k, "rotulo": v} for k, v in contatos_unicos.items()]
+    lista_ordenada.sort(key=lambda x: x["rotulo"].lower())
+    return lista_ordenada
+
+
+def listar_atendimentos_pausados():
+    """Retorna a lista de números que estão atualmente em atendimento humano."""
+    pausados = set(pausa_memoria)
+    try:
+        if os.path.exists(EXCEL_FILE):
+            xls = pd.ExcelFile(EXCEL_FILE)
+            if "Controle_Alunos" in xls.sheet_names:
+                df_controle = pd.read_excel(EXCEL_FILE, sheet_name="Controle_Alunos")
+                if not df_controle.empty and "Humano" in df_controle.columns:
+                    ativos = df_controle[
+                        df_controle["Humano"].astype(str).str.upper() == "SIM"
+                    ]
+                    for num in ativos["ID_Usuario"].dropna().tolist():
+                        pausados.add(str(num))
+    except Exception as e:
+        print(f"[AVISO] Erro ao listar pausados: {e}")
+    return sorted(list(pausados))
+
+
+def carregar_numeros_bloqueados():
+    try:
+        if not os.path.exists(EXCEL_FILE):
+            return []
+        df_bloq = pd.read_excel(EXCEL_FILE, sheet_name="TelefoneContatos_Bloqueados")
+        return [normalizar_telefone(num) for num in df_bloq["Telefone"].dropna().tolist()]
+    except Exception as e:
+        print(f"[ERRO] Falha ao carregar bloqueados: {e}")
+        return []
+
+
+def gerenciar_estado_humano(numero_norm, acao="verificar"):
+    if not numero_norm:
+        return False
+
+    if acao == "verificar" and numero_norm in pausa_memoria:
+        return True
+
+    try:
+        if not os.path.exists(EXCEL_FILE):
+            return numero_norm in pausa_memoria
+
+        todas_abas = pd.read_excel(EXCEL_FILE, sheet_name=None)
+        df_controle = todas_abas.get(
+            "Controle_Alunos",
+            pd.DataFrame(
+                columns=[
+                    "ID_Usuario",
+                    "Nome_Aluno",
+                    "Status",
+                    "Ultima_Interacao",
+                    "Etapa",
+                    "Humano",
+                ]
+            ),
+        )
+        df_controle["ID_Usuario"] = df_controle["ID_Usuario"].astype(str)
+
+        if acao == "verificar":
+            reg = df_controle[df_controle["ID_Usuario"] == numero_norm]
+            if not reg.empty:
+                esta_humano = str(reg.iloc[-1]["Humano"]).strip().upper() == "SIM"
+                if esta_humano:
+                    pausa_memoria.add(numero_norm)
+                return esta_humano
+            return False
+
+        elif acao in ["ativar", "desativar"]:
+            if acao == "ativar":
+                pausa_memoria.add(numero_norm)
+            else:
+                pausa_memoria.discard(numero_norm)
+
+            status_humano = "SIM" if acao == "ativar" else "NAO"
+            etapa_atual = "Atendimento Humano" if acao == "ativar" else "Finalizado"
+
+            if numero_norm in df_controle["ID_Usuario"].values:
+                df_controle.loc[
+                    df_controle["ID_Usuario"] == numero_norm, "Humano"
+                ] = status_humano
+                df_controle.loc[
+                    df_controle["ID_Usuario"] == numero_norm, "Ultima_Interacao"
+                ] = agora_brasil()
+                df_controle.loc[
+                    df_controle["ID_Usuario"] == numero_norm, "Etapa"
+                ] = etapa_atual
+            else:
+                nova_linha = pd.DataFrame(
+                    [
+                        {
+                            "ID_Usuario": numero_norm,
+                            "Nome_Aluno": "Aluno WhatsApp",
+                            "Status": "Ativo",
+                            "Ultima_Interacao": agora_brasil(),
+                            "Etapa": etapa_atual,
+                            "Humano": status_humano,
+                        }
+                    ]
+                )
+                df_controle = pd.concat([df_controle, nova_linha], ignore_index=True)
+
+            todas_abas["Controle_Alunos"] = df_controle
+            with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl") as writer:
+                for nome_aba, df_aba in todas_abas.items():
+                    df_aba.to_excel(writer, sheet_name=nome_aba, index=False)
+            return True
+
+    except Exception as e:
+        print(f"[ERRO] Falha ao gravar estado humano no Excel: {e}")
+        return numero_norm in pausa_memoria
+
+
+def registrar_metrica(
+    numero_aluno, categoria, processo, duvida, desfecho, resolvido="Sim"
+):
+    try:
+        if not os.path.exists(EXCEL_FILE):
+            return
+
+        todas_abas = pd.read_excel(EXCEL_FILE, sheet_name=None)
+        nome_aba_metricas = (
+            "Metricas_Atendimentos "
+            if "Metricas_Atendimentos " in todas_abas
+            else "Metricas_Atendimentos"
+        )
+
+        df_met = todas_abas.get(
+            nome_aba_metricas,
+            pd.DataFrame(
+                columns=[
+                    "ID_Log",
+                    "Data_Hora",
+                    "ID_Usuario",
+                    "Canal",
+                    "Categoria",
+                    "Processo",
+                    "Duvida_Aluno",
+                    "Desfecho",
+                    "Resolvido",
+                ]
+            ),
+        )
+
+        novo_id = len(df_met) + 1
+        nova_linha = pd.DataFrame(
+            [
+                {
+                    "ID_Log": novo_id,
+                    "Data_Hora": agora_brasil(),
+                    "ID_Usuario": numero_aluno,
+                    "Canal": "WhatsApp",
+                    "Categoria": categoria,
+                    "Processo": processo,
+                    "Duvida_Aluno": duvida,
+                    "Desfecho": desfecho,
+                    "Resolvido": resolvido,
+                }
+            ]
+        )
+
+        todas_abas[nome_aba_metricas] = pd.concat([df_met, nova_linha], ignore_index=True)
+
+        with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl") as writer:
+            for nome_aba, df_aba in todas_abas.items():
+                df_aba.to_excel(writer, sheet_name=nome_aba, index=False)
+
+    except Exception as e:
+        print(f"[ERRO] Falha ao registrar métrica: {e}")
+
+
+def gerar_texto_menu_principal():
+    df_menu = pd.read_excel(EXCEL_FILE, sheet_name="Menu_Principal")
+    menu_texto = (
+        "👋 Bem-vinda(o) ao atendimento acadêmico da Sofia!\n\n"
+        "Escolha uma das opções abaixo digitando apenas o *número* correspondente:\n\n"
     )
-
-
-def responder_bot(telefone: str, mensagem: str) -> str:
-    conv = obter_conversa(telefone)
-    texto = normalizar_texto(mensagem)
-    baixo = texto.lower()
-
-    if baixo in ("0", "encerrar", "#finalizar"):
-        reativar_robo(telefone, "comando_encerrar")
-        return MENSAGEM_ENCERRAMENTO
-
-    if baixo in ("5", "atendente", "humano"):
-        pausar_para_humano(telefone, "aluno_digitou_5")
-        return "Encaminhando para atendimento humano. Aguarde um instante."
-
-    if baixo in ("menu", "oi", "olá", "ola", "bom dia", "boa tarde", "boa noite"):
-        conv["etapa"] = "menu_inicial"
-        return menu_sofia_texto()
-
-    opcao = converter_numero_seguro(texto)
-    if opcao == 1:
-        conv["etapa"] = "menu_inicial"
-        return "As provas individuais são liberadas conforme o calendário de cada disciplina."
-    if opcao == 2:
-        conv["etapa"] = "menu_inicial"
-        return "Confira os dias e horários das aulas no portal acadêmico."
-    if opcao == 3:
-        conv["etapa"] = "menu_inicial"
-        return "A secretaria acadêmica atende pelos canais oficiais da instituição."
-
-    return (
-        "Desculpe, não encontrei essa opção. 🤔\n\n"
-        "• Digite *menu* para ver as opções\n"
-        "• Digite *0* para encerrar"
+    for _, row in df_menu.iterrows():
+        num_val = converter_numero_seguro(row.get("Numero"))
+        num_fmt = int(num_val) if num_val is not None else row.get("Numero")
+        menu_texto += f"• *{num_fmt}* — {row.get('Opcao', '')}\n"
+    menu_texto += (
+        "\n-----------------------------------\n"
+        "💡 *Como continuar:*\n"
+        "• Digite *menu* para voltar ao início\n"
+        "• Digite *0* para encerrar o atendimento"
     )
+    return menu_texto
 
 
-# ==========================================
-# ROTAS DO PAINEL E WEBHOOK
-# ==========================================
+def formatar_resposta(row):
+    cat = row.get("Categoria ", "")
+    proc = row.get("Processo ", "")
+    resp = row.get("Instrucoes_Tecnicas", "Consulte os detalhes no portal.")
+    link_arquivo = row.get("Link_Arquivo", "")
 
-@app.route("/")
-def index():
+    texto_final = f"📌 *{cat} — {proc}*\n\n{resp}"
+
+    if pd.notna(link_arquivo) and str(link_arquivo).strip() != "":
+        texto_final += (
+            f"\n\n📂 *Material / Documento Associado:*\n{str(link_arquivo).strip()}"
+        )
+
+    texto_final += (
+        "\n\n-----------------------------------\n"
+        "💡 *Como continuar:*\n"
+        "• Digite *menu* para voltar ao início\n"
+        "• Digite *0* para encerrar o atendimento"
+    )
+    return texto_final
+
+
+# ==============================================================================
+# 3. MOTOR DE CONSULTA AO EXCEL
+# ==============================================================================
+
+def consultar_excel(pergunta, numero_aluno_norm):
+    try:
+        if not os.path.exists(EXCEL_FILE):
+            return "⚠️ Erro: Arquivo de diretório acadêmico não encontrado no servidor."
+
+        pergunta_limpa = str(pergunta or "").strip().lower()
+
+        comandos_saida = ["0", "encerrar", "sair", "encerrar atendimento", "#finalizar"]
+        if pergunta_limpa in comandos_saida or eh_mensagem_encerramento(pergunta_limpa):
+            gerenciar_estado_humano(numero_aluno_norm, acao="desativar")
+            registrar_metrica(
+                numero_aluno_norm,
+                "Encerramento",
+                "Saída do Usuário",
+                pergunta,
+                "Atendimento Encerrado",
+                "Sim",
+            )
+            return MENSAGEM_ENCERRAMENTO
+
+        comandos_menu = [
+            "oi",
+            "ola",
+            "olá",
+            "bom dia",
+            "boa tarde",
+            "boa noite",
+            "menu",
+            "ajuda",
+        ]
+        if pergunta_limpa in comandos_menu:
+            registrar_metrica(
+                numero_aluno_norm,
+                "Menu Principal",
+                "Início / Boas-vindas",
+                pergunta,
+                "Exibiu Menu Principal",
+                "Sim",
+            )
+            return gerar_texto_menu_principal()
+
+        df_faq = pd.read_excel(EXCEL_FILE, sheet_name="FAQ_BaseNumero_Menu")
+
+        if pergunta_limpa.isdigit() and len(pergunta_limpa) == 1:
+            num_opcao = converter_numero_seguro(pergunta_limpa)
+
+            if num_opcao == 5.0:
+                gerenciar_estado_humano(numero_aluno_norm, acao="ativar")
+                registrar_metrica(
+                    numero_aluno_norm,
+                    "Atendimento Humano",
+                    "Transbordo Humano",
+                    pergunta,
+                    "Transferido para Atendente",
+                    "Em andamento",
+                )
+                filtrado_5 = df_faq[df_faq["Numero_Menu"] == 5.0]
+                msg_humano = "👩‍💻 *Transferindo para o Atendimento Humano...*\n\n"
+                if not filtrado_5.empty:
+                    msg_humano += str(
+                        filtrado_5.iloc[0].get(
+                            "Instrucoes_Tecnicas",
+                            "Aguarde um momento, um de nossos atendentes já vai falar com você.",
+                        )
+                    )
+                else:
+                    msg_humano += (
+                        "Aguarde um momento, um de nossos atendentes já vai falar com você."
+                    )
+
+                msg_humano += "\n\n_(O robô ficará pausado durante este atendimento)_"
+                return msg_humano
+
+            filtrado = df_faq[df_faq["Numero_Menu"] == num_opcao]
+
+            if not filtrado.empty:
+                if len(filtrado) == 1:
+                    row_unica = filtrado.iloc[0]
+                    registrar_metrica(
+                        numero_aluno_norm,
+                        row_unica.get("Categoria ", ""),
+                        row_unica.get("Processo ", ""),
+                        pergunta,
+                        "Resposta Direta",
+                        "Sim",
+                    )
+                    return formatar_resposta(row_unica)
+
+                cat_nome = filtrado.iloc[0].get("Categoria ", "Atendimento")
+                registrar_metrica(
+                    numero_aluno_norm,
+                    cat_nome,
+                    "Listagem Submenu",
+                    pergunta,
+                    "Exibiu Submenus",
+                    "Sim",
+                )
+                sub_texto = (
+                    f"📌 *{cat_nome}*\n\n"
+                    f"Digite o número da opção desejada (exemplo: *{int(num_opcao)}.1*):\n\n"
+                )
+
+                for _, row in filtrado.iterrows():
+                    sub_val = converter_numero_seguro(row.get("Numero_Submenu", 1))
+                    sub_num = int(sub_val) if sub_val is not None else 1
+                    proc = row.get("Processo ", "")
+                    sub_texto += f"• *{int(num_opcao)}.{sub_num}* — {proc}\n"
+
+                sub_texto += (
+                    "\n-----------------------------------\n"
+                    "💡 *Outras opções:*\n"
+                    "• Digite *menu* para voltar ao menu principal\n"
+                    "• Digite *0* para encerrar o atendimento"
+                )
+                return sub_texto
+
+        if "." in pergunta_limpa:
+            partes = pergunta_limpa.split(".")
+            menu_num = converter_numero_seguro(partes[0])
+            sub_num = converter_numero_seguro(partes[-1])
+            if menu_num is not None and sub_num is not None:
+                if menu_num == 5.0:
+                    gerenciar_estado_humano(numero_aluno_norm, acao="ativar")
+
+                encontrado = df_faq[
+                    (df_faq["Numero_Menu"] == menu_num)
+                    & (df_faq["Numero_Submenu"] == sub_num)
+                ]
+                if not encontrado.empty:
+                    row = encontrado.iloc[0]
+                    registrar_metrica(
+                        numero_aluno_norm,
+                        row.get("Categoria ", ""),
+                        row.get("Processo ", ""),
+                        pergunta,
+                        "Resposta Submenu",
+                        "Sim",
+                    )
+                    return formatar_resposta(row)
+
+        for _, row in df_faq.iterrows():
+            categoria = str(row.get("Categoria ", "")).lower()
+            processo = str(row.get("Processo ", "")).lower()
+            palavras_chave = str(row.get("Palavras_Chave", "")).lower()
+
+            if (
+                (pergunta_limpa in palavras_chave)
+                or (pergunta_limpa in processo)
+                or (pergunta_limpa in categoria)
+            ):
+                registrar_metrica(
+                    numero_aluno_norm,
+                    row.get("Categoria ", ""),
+                    row.get("Processo ", ""),
+                    pergunta,
+                    "Busca Palavra-Chave",
+                    "Sim",
+                )
+                return formatar_resposta(row)
+
+        registrar_metrica(
+            numero_aluno_norm,
+            "Não Identificado",
+            "Fallback",
+            pergunta,
+            "Opção não encontrada",
+            "Não",
+        )
+        return (
+            "Desculpe, não encontrei essa opção no diretório acadêmico. 🤔\n\n"
+            "• Digite *menu* para ver as opções disponíveis\n"
+            "• Digite *0* para encerrar o atendimento"
+        )
+
+    except Exception as e:
+        return (
+            "Desculpe, não encontrei essa opção no diretório acadêmico. 🤔\n\n"
+            "• Digite *menu* para ver as opções disponíveis\n"
+            "• Digite *0* para encerrar o atendimento"
+        )
+
+
+# ==============================================================================
+# 4. ENVIO DE MENSAGENS, PAINEL ÚNICO (/) E WEBHOOK
+# ==============================================================================
+
+def enviar_mensagem_whatsapp(numero_destino, texto_resposta):
+    url = f"{EVOLUTION_API_URL}/message/sendText/{INSTANCE_NAME}"
+    headers = {
+        "Content-Type": "application/json",
+        "apikey": EVOLUTION_API_KEY,
+    }
+    payload = {
+        "number": numero_destino,
+        "text": texto_resposta,
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        print(
+            f"[ENVIO API] Status: {response.status_code} | Destino: {numero_destino} | Resp: {response.text}"
+        )
+        return response.json()
+    except Exception as e:
+        print(f"[ERRO] Falha ao enviar mensagem: {e}")
+        return None
+
+
+@app.route("/", methods=["GET", "POST"])
+@app.route("/iniciar", methods=["GET", "POST"])
+def painel_central():
     session.permanent = True
-    session["chave_liberada"] = True
+    session["sofia_autenticada"] = True
 
-    contatos = obter_lista_contatos_combinada()
-    bloqueados_qtd = len(carregar_bloqueados_excel()) or 7
-    pausados = [c for c in conversas.values() if c["robo_pausado"]]
+    alerta = ""
+    tipo_alerta = "info"
+
+    if request.method == "POST":
+        acao = request.form.get("acao", "")
+        if not chave_autenticada(request):
+            alerta = "❌ Senha incorreta! Digite a chave de acesso correta."
+            tipo_alerta = "erro"
+        else:
+            if acao == "ativar_webhook":
+                ok, msg = configurar_webhook_automatico()
+                alerta = f"✅ {msg}" if ok else f"❌ {msg}"
+                tipo_alerta = "ok" if ok else "erro"
+
+            elif acao == "iniciar_contato":
+                contato_salvo = request.form.get("contato_salvo", "").strip()
+                numero_manual = request.form.get("numero_manual", "").strip()
+                modo = request.form.get("modo", "menu")
+                mensagem_custom = request.form.get("mensagem", "").strip()
+
+                numero_final = numero_manual if numero_manual else contato_salvo
+                if not numero_final:
+                    alerta = "❌ Selecione um contato da lista ou digite um número."
+                    tipo_alerta = "erro"
+                else:
+                    num_envio = formatar_para_envio(numero_final)
+                    num_norm = normalizar_telefone(num_envio)
+
+                    if modo == "menu":
+                        gerenciar_estado_humano(num_norm, acao="desativar")
+                        texto_envio = gerar_texto_menu_principal()
+                        registrar_metrica(
+                            num_norm,
+                            "Contato Ativo",
+                            "Disparo Menu Sofia",
+                            "Início Ativo",
+                            "Menu Enviado",
+                            "Sim",
+                        )
+                    elif modo == "encerrar":
+                        texto_envio = mensagem_custom or MENSAGEM_ENCERRAMENTO
+                        gerenciar_estado_humano(num_norm, acao="desativar")
+                        registrar_metrica(
+                            num_norm,
+                            "Encerramento",
+                            "Disparo Encerramento",
+                            texto_envio,
+                            "Robô Reativado",
+                            "Sim",
+                        )
+                    else:
+                        if eh_mensagem_encerramento(mensagem_custom):
+                            gerenciar_estado_humano(num_norm, acao="desativar")
+                            texto_envio = mensagem_custom
+                        else:
+                            gerenciar_estado_humano(num_norm, acao="ativar")
+                            texto_envio = (
+                                mensagem_custom
+                                or "Olá! Tudo bem? Aqui é da equipe acadêmica, como posso ajudar?"
+                            )
+                        registrar_metrica(
+                            num_norm,
+                            "Contato Ativo",
+                            "Disparo Humano",
+                            texto_envio,
+                            "Atendimento Humano Iniciado",
+                            "Em andamento",
+                        )
+
+                    resp = enviar_mensagem_whatsapp(num_envio, texto_envio)
+                    if resp and (
+                        "key" in str(resp) or "PENDING" in str(resp) or "status" in str(resp)
+                    ):
+                        alerta = f"✅ Mensagem enviada para {num_envio}!"
+                        tipo_alerta = "ok"
+                    else:
+                        alerta = f"⚠️ Resposta da API: {resp}"
+                        tipo_alerta = "erro"
+
+            elif acao == "reativar_robo":
+                num_target = request.form.get("num_target", "")
+                gerenciar_estado_humano(num_target, acao="desativar")
+                alerta = f"✅ Robô reativado para o contato {num_target}!"
+                tipo_alerta = "ok"
+
+            elif acao == "pausar_robo":
+                num_pausar = normalizar_telefone(request.form.get("num_pausar", ""))
+                if num_pausar:
+                    gerenciar_estado_humano(num_pausar, acao="ativar")
+                    alerta = f"⏸️ Robô pausado (modo atendimento humano) para {num_pausar}."
+                    tipo_alerta = "ok"
+
+    contatos_lista = buscar_contatos_whatsapp()
+    pausados_lista = listar_atendimentos_pausados()
+    bloqueados_lista = carregar_numeros_bloqueados()
+
+    status_conexao = "Desconhecido"
+    try:
+        r_st = requests.get(
+            f"{EVOLUTION_API_URL}/instance/connectionState/{INSTANCE_NAME}",
+            headers={"apikey": EVOLUTION_API_KEY},
+            timeout=5,
+        )
+        if r_st.status_code == 200:
+            status_conexao = r_st.json().get("instance", {}).get("state", "open")
+    except Exception:
+        status_conexao = "open"
 
     html = """
     <!DOCTYPE html>
-    <html lang="pt-br">
+    <html lang="pt-BR">
     <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Painel Central — Sofia Oficial</title>
-      <style>
-        * { box-sizing: border-box; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-        body { margin: 0; background: #f4f6f8; color: #1f2937; padding: 24px; }
-        .container { max-width: 1180px; margin: 0 auto; }
-        .header-banner {
-          background: #13795b; color: #fff; border-radius: 10px; padding: 20px 24px;
-          display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;
-        }
-        .header-banner h1 { margin: 0; font-size: 1.5rem; }
-        .header-sub { margin-top: 6px; font-size: 0.9rem; opacity: 0.95; }
-        .status-badge {
-          background: rgba(255,255,255,0.18); padding: 6px 12px; border-radius: 999px; font-size: 0.85rem;
-        }
-        .key-box {
-          background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px;
-          padding: 14px 18px; margin-top: 16px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-        }
-        .key-box input {
-          padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; min-width: 240px;
-        }
-        .toolbar {
-          display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 16px;
-        }
-        .btn {
-          border: none; border-radius: 7px; padding: 12px 16px; color: #fff;
-          font-weight: 600; cursor: pointer; font-size: 0.95rem; width: 100%;
-        }
-        .btn-orange { background: #e67e22; }
-        .btn-green { background: #198754; }
-        .btn-blue { background: #0d6efd; }
-        .btn-teal { background: #0f766e; }
-        .btn-sm { padding: 6px 10px; font-size: 0.82rem; width: auto; }
-        .grid-2 {
-          display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 20px; align-items: start;
-        }
-        .card {
-          background: #fff; border-radius: 10px; padding: 20px; box-shadow: 0 1px 4px rgba(0,0,0,0.06);
-        }
-        .card h2 { margin: 0 0 14px 0; font-size: 1.15rem; }
-        .field { margin-bottom: 12px; }
-        .field label { display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 5px; }
-        .field input, .field select, .field textarea {
-          width: 100%; padding: 9px 11px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.92rem;
-        }
-        .pause-row { display: flex; gap: 8px; margin-bottom: 14px; }
-        .pause-row input { flex: 1; padding: 9px 11px; border: 1px solid #d1d5db; border-radius: 6px; }
-        .muted { color: #6b7280; font-size: 0.88rem; }
-        .item-pausado {
-          display: flex; justify-content: space-between; align-items: center;
-          padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 7px; margin-bottom: 8px;
-        }
-        .feedback { margin-top: 12px; font-size: 0.92rem; font-weight: 600; color: #0f766e; }
-        @media (max-width: 850px) {
-          .toolbar, .grid-2 { grid-template-columns: 1fr; }
-        }
-      </style>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Painel Central - Sofia Oficial</title>
+        <style>
+            body { font-family: 'Segoe UI', Arial, sans-serif; background: #f1f5f9; margin: 0; padding: 20px; color: #1e293b; }
+            .container { max-width: 960px; margin: auto; }
+            .header { background: #0f766e; color: white; padding: 20px 25px; border-radius: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 15px; }
+            .header h1 { margin: 0; font-size: 22px; }
+            .badge { background: rgba(255,255,255,0.2); padding: 6px 12px; border-radius: 20px; font-size: 13px; }
+            .toolbar { display: flex; gap: 10px; flex-wrap: wrap; margin: 20px 0; }
+            .btn { padding: 11px 18px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; text-decoration: none; font-size: 14px; display: inline-flex; align-items: center; gap: 6px; }
+            .btn-primary { background: #0284c7; color: white; }
+            .btn-primary:hover { background: #0369a1; }
+            .btn-success { background: #16a34a; color: white; }
+            .btn-success:hover { background: #15803d; }
+            .btn-warning { background: #d97706; color: white; }
+            .btn-warning:hover { background: #b45309; }
+            .btn-teal { background: #0f766e; color: white; width: 100%; justify-content: center; font-size: 15px; margin-top: 15px; }
+            .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+            @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
+            .card { background: white; padding: 22px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+            .card h2 { margin-top: 0; font-size: 18px; color: #0f766e; border-bottom: 1px solid #e2e8f0; padding-bottom: 10px; }
+            label { display: block; margin-top: 12px; font-weight: 600; font-size: 13px; color: #475569; }
+            input, select, textarea { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #cbd5e1; border-radius: 6px; box-sizing: border-box; font-size: 14px; }
+            .alerta { padding: 14px; border-radius: 8px; margin-bottom: 20px; font-weight: bold; }
+            .alerta.ok { background: #dcfce7; color: #166534; border: 1px solid #86efac; }
+            .alerta.erro { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
+            .lista-item { display: flex; justify-content: space-between; align-items: center; padding: 10px; border-bottom: 1px solid #f1f5f9; }
+            .senha-box { background: #fffbeb; border: 1px solid #fde68a; padding: 12px 18px; border-radius: 8px; margin-bottom: 15px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+            .senha-box input { max-width: 240px; margin-top: 0; }
+        </style>
+        <script>
+            const CHAVE_PADRAO = "{{ chave_padrao }}";
+            function filtrarContatos() {
+                var input = document.getElementById("filtro").value.toLowerCase();
+                var select = document.getElementById("contato_salvo");
+                for (var i = 0; i < select.options.length; i++) {
+                    var txt = select.options[i].text.toLowerCase();
+                    select.options[i].style.display = txt.includes(input) ? "" : "none";
+                }
+            }
+            function sincronizarSenha(val) {
+                var limpa = (val || CHAVE_PADRAO).trim();
+                localStorage.setItem("sofia_chave_acesso", limpa);
+                var campos = document.getElementsByClassName("campo-senha-oculto");
+                for (var i = 0; i < campos.length; i++) {
+                    campos[i].value = limpa;
+                }
+            }
+            window.addEventListener("DOMContentLoaded", function() {
+                var salva = localStorage.getItem("sofia_chave_acesso");
+                var valorFinal = (salva && salva !== "CHAVE_ACESSO") ? salva : CHAVE_PADRAO;
+                var inputSenha = document.getElementById("senha_mestra");
+                if (inputSenha) {
+                    inputSenha.value = valorFinal;
+                }
+                sincronizarSenha(valorFinal);
+            });
+        </script>
     </head>
     <body>
-      <div class="container">
-        <div class="header-banner">
-          <div>
-            <h1>🤖 Painel Central — Sofia Oficial</h1>
-            <div class="header-sub">
-              Instância: <strong>{{ instancia }}</strong> | Bloqueados na lista: <strong>{{ bloqueados }}</strong>
-            </div>
-          </div>
-          <div class="status-badge">Status WhatsApp: <strong>{{ status_whatsapp }}</strong></div>
-        </div>
-
-        <div class="key-box">
-          <span>🔑 <strong>Chave de Acesso:</strong></span>
-          <input id="chaveAcesso" type="text" value="{{ chave_padrao }}" placeholder="Digite cetrus2026teste para liberar">
-          <span class="muted">Salva automaticamente por 30 dias (sem precisar redigitar).</span>
-        </div>
-
-        <div class="toolbar">
-          <button class="btn btn-orange" onclick="acaoRapida('/api/webhook/corrigir')">🔌 1. Ativar/Corrigir Webhook Oficial</button>
-          <button class="btn btn-green" onclick="baixarMetricas()">📥 2. Baixar Planilha de Métricas (.xlsx)</button>
-          <button class="btn btn-blue" onclick="atualizarContatos()">🔄 3. Atualizar Contatos e Fila</button>
-        </div>
-
-        <div id="feedback" class="feedback"></div>
-
-        <div class="grid-2">
-          <div class="card">
-            <h2>📲 Iniciar Contato com Aluno</h2>
-            <div class="field">
-              <label>Buscar nos Contatos Salvos ({{ contatos|length }}):</label>
-              <input id="buscaContato" type="text" placeholder="🔍 Digite nome ou número..." oninput="filtrarContatos()">
-            </div>
-            <div class="field">
-              <select id="selectContato" onchange="selecionarContato()">
-                <option value="">-- Selecione um contato do WhatsApp --</option>
-                {% for c in contatos %}
-                <option value="{{ c.telefone }}">{{ c.nome }} ({{ c.telefone }})</option>
-                {% endfor %}
-              </select>
-            </div>
-            <div class="field">
-              <label>OU Digite um Número Novo (com DDD):</label>
-              <input id="numeroNovo" type="text" placeholder="Ex: 11988887777">
-            </div>
-            <div class="field">
-              <label>Tipo de Início:</label>
-              <select id="tipoInicio">
-                <option value="menu_sofia">Enviar Menu Automático da Sofia</option>
-                <option value="mensagem_manual">Enviar Mensagem Manual</option>
-                <option value="encerrar">Enviar Mensagem de Encerramento (Reativa Robô)</option>
-              </select>
-            </div>
-            <div class="field">
-              <label>Mensagem Manual (opcional se escolheu opção 2):</label>
-              <textarea id="mensagemManual" rows="3" placeholder="Olá! Aqui é da secretaria acadêmica..."></textarea>
-            </div>
-            <button class="btn btn-teal" onclick="enviarContato()">🚀 Enviar Mensagem Agora</button>
-          </div>
-
-          <div class="card">
-            <h2>🧑‍💻 Atendimentos Humanos (Robô Pausado)</h2>
-            <p class="muted">
-              Quando um aluno digita <strong>5</strong> ou o atendente envia mensagem, o número aparece aqui e o robô fica em silêncio até clicar em <strong>Reativar</strong>, enviar <strong>#finalizar</strong> ou enviar a mensagem de encerramento no WhatsApp.
-            </p>
-            <div class="pause-row">
-              <input id="numeroPausar" type="text" placeholder="Pausar número (DDD + Num)">
-              <button class="btn btn-orange btn-sm" onclick="pausarNumero()">⏸ Pausar</button>
-            </div>
-
-            {% if pausados %}
-              {% for p in pausados %}
-              <div class="item-pausado">
+        <div class="container">
+            <div class="header">
                 <div>
-                  <strong>{{ p.telefone }}</strong><br>
-                  <span class="muted">Atualizado: {{ p.atualizado_em }}</span>
+                    <h1>🤖 Painel Central — Sofia Oficial</h1>
+                    <small>Instância: <b>{{ instancia }}</b> | Bloqueados na lista: <b>{{ total_bloqueados }}</b></small>
                 </div>
-                <button class="btn btn-green btn-sm" onclick="reativarNumero('{{ p.telefone }}')">▶️ Devolver ao Robô</button>
-              </div>
-              {% endfor %}
-            {% else %}
-              <p class="muted" style="text-align:center; padding: 18px 0;">Nenhum atendimento humano ativo no momento.</p>
+                <div class="badge">Status WhatsApp: <b>{{ status_conexao }}</b></div>
+            </div>
+
+            <div class="senha-box" style="margin-top: 15px;">
+                <label style="margin:0;">🔑 Chave de Acesso:</label>
+                <input type="text" id="senha_mestra" onkeyup="sincronizarSenha(this.value)" placeholder="Digite cetrus2026teste para liberar ações">
+                <small style="color:#92400e;">Salva automaticamente por 30 dias (sem precisar redigitar).</small>
+            </div>
+
+            <div class="toolbar">
+                <form method="POST" style="margin:0;">
+                    <input type="hidden" name="acao" value="ativar_webhook">
+                    <input type="hidden" name="senha" class="campo-senha-oculto">
+                    <button type="submit" class="btn btn-warning">🔌 1. Ativar/Corrigir Webhook Oficial</button>
+                </form>
+
+                <a href="/metricas" class="btn btn-success">📥 2. Baixar Planilha de Métricas (.xlsx)</a>
+
+                <a href="/" class="btn btn-primary">🔄 3. Atualizar Contatos e Fila</a>
+            </div>
+
+            {% if alerta %}
+                <div class="alerta {{ tipo_alerta }}">{{ alerta }}</div>
             {% endif %}
-          </div>
+
+            <div class="grid">
+                <div class="card">
+                    <h2>📲 Iniciar Contato com Aluno</h2>
+                    <form method="POST">
+                        <input type="hidden" name="acao" value="iniciar_contato">
+                        <input type="hidden" name="senha" class="campo-senha-oculto">
+
+                        <label>Buscar nos Contatos Salvos ({{ total_contatos }}):</label>
+                        <input type="text" id="filtro" onkeyup="filtrarContatos()" placeholder="🔍 Digite nome ou número...">
+                        <select name="contato_salvo" id="contato_salvo">
+                            <option value="">-- Selecione um contato do WhatsApp --</option>
+                            {% for c in contatos %}
+                                <option value="{{ c.numero }}">{{ c.rotulo }}</option>
+                            {% endfor %}
+                        </select>
+
+                        <label>OU Digite um Número Novo (com DDD):</label>
+                        <input type="text" name="numero_manual" placeholder="Ex: 11988887777">
+
+                        <label>Tipo de Início:</label>
+                        <select name="modo">
+                            <option value="menu">Enviar Menu Automático da Sofia</option>
+                            <option value="humano">Enviar Mensagem Manual (Pausar Robô)</option>
+                            <option value="encerrar">Enviar Mensagem de Encerramento (Reativa Robô)</option>
+                        </select>
+
+                        <label>Mensagem Manual (opcional):</label>
+                        <textarea name="mensagem" rows="3" placeholder="Olá! Aqui é da secretaria acadêmica..."></textarea>
+
+                        <button type="submit" class="btn btn-teal">🚀 Enviar Mensagem Agora</button>
+                    </form>
+                </div>
+
+                <div class="card">
+                    <h2>🧑‍💻 Atendimentos Humanos (Robô Pausado)</h2>
+                    <p style="font-size: 13px; color: #64748b; margin-top: 0;">
+                        Quando um aluno digita <b>5</b> ou o atendente envia mensagem, o número aparece aqui e o robô fica em silêncio até clicar em <b>Reativar</b>, enviar <b>#finalizar</b> ou enviar a mensagem de encerramento no WhatsApp.
+                    </p>
+
+                    <form method="POST" style="display:flex; gap:8px; margin-bottom:15px;">
+                        <input type="hidden" name="acao" value="pausar_robo">
+                        <input type="hidden" name="senha" class="campo-senha-oculto">
+                        <input type="text" name="num_pausar" placeholder="Pausar número (DDD + Num)" style="margin-top:0;">
+                        <button type="submit" class="btn btn-warning" style="white-space:nowrap;">⏸ Pausar</button>
+                    </form>
+
+                    {% if pausados %}
+                        {% for p in pausados %}
+                            <div class="lista-item">
+                                <span><b>{{ p }}</b></span>
+                                <form method="POST" style="margin:0;">
+                                    <input type="hidden" name="acao" value="reativar_robo">
+                                    <input type="hidden" name="senha" class="campo-senha-oculto">
+                                    <input type="hidden" name="num_target" value="{{ p }}">
+                                    <button type="submit" class="btn btn-success" style="padding:6px 12px; font-size:12px;">▶️ Devolver ao Robô</button>
+                                </form>
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <p style="text-align:center; color:#94a3b8; padding: 20px 0;">Nenhum atendimento humano ativo no momento.</p>
+                    {% endif %}
+                </div>
+            </div>
         </div>
-      </div>
-
-      <script>
-        const CHAVE_FIXA = "{{ chave_padrao }}";
-        const inputChave = document.getElementById("chaveAcesso");
-        const salvaLocal = localStorage.getItem("sofia_chave_acesso");
-
-        if (salvaLocal && salvaLocal !== "CHAVE_ACESSO" && salvaLocal.trim() !== "") {
-          inputChave.value = salvaLocal;
-        } else {
-          inputChave.value = CHAVE_FIXA;
-          localStorage.setItem("sofia_chave_acesso", CHAVE_FIXA);
-        }
-
-        inputChave.addEventListener("change", () => {
-          const val = inputChave.value.trim() || CHAVE_FIXA;
-          inputChave.value = val;
-          localStorage.setItem("sofia_chave_acesso", val);
-        });
-
-        function headersAuth() {
-          return {
-            "Content-Type": "application/json",
-            "X-Access-Key": (inputChave.value.trim() || CHAVE_FIXA)
-          };
-        }
-
-        function setFeedback(msg, isErro = false) {
-          const el = document.getElementById("feedback");
-          el.style.color = isErro ? "#dc2626" : "#0f766e";
-          el.textContent = msg;
-        }
-
-        function filtrarContatos() {
-          const termo = document.getElementById("buscaContato").value.toLowerCase();
-          const select = document.getElementById("selectContato");
-          for (const opt of select.options) {
-            if (!opt.value) continue;
-            opt.hidden = !opt.text.toLowerCase().includes(termo);
-          }
-        }
-
-        function selecionarContato() {
-          const val = document.getElementById("selectContato").value;
-          if (val) document.getElementById("numeroNovo").value = val;
-        }
-
-        async function acaoRapida(url) {
-          const res = await fetch(url, { method: "POST", headers: headersAuth() });
-          const data = await res.json();
-          setFeedback(data.mensagem || "Ação executada.", !data.ok);
-        }
-
-        async function baixarMetricas() {
-          const chave = encodeURIComponent(inputChave.value.trim() || CHAVE_FIXA);
-          window.location.href = `/api/metricas/xlsx?chave_acesso=${chave}`;
-          setFeedback("Download da planilha de métricas iniciado.");
-        }
-
-        async function atualizarContatos() {
-          const res = await fetch("/api/contatos/atualizar", { method: "POST", headers: headersAuth() });
-          const data = await res.json();
-          setFeedback(data.mensagem || "Contatos atualizados.", !data.ok);
-          if (data.ok) setTimeout(() => location.reload(), 700);
-        }
-
-        async function enviarContato() {
-          const telefone = document.getElementById("numeroNovo").value.trim();
-          const tipo = document.getElementById("tipoInicio").value;
-          const mensagem = document.getElementById("mensagemManual").value;
-          const res = await fetch("/api/iniciar-contato", {
-            method: "POST",
-            headers: headersAuth(),
-            body: JSON.stringify({ telefone, tipo, mensagem })
-          });
-          const data = await res.json();
-          setFeedback(data.mensagem || "Enviado.", !data.ok);
-          if (data.ok) {
-            setTimeout(() => location.reload(), 900);
-          }
-        }
-
-        async function pausarNumero() {
-          const telefone = document.getElementById("numeroPausar").value.trim();
-          const res = await fetch("/api/pausar", {
-            method: "POST",
-            headers: headersAuth(),
-            body: JSON.stringify({ telefone })
-          });
-          const data = await res.json();
-          setFeedback(data.mensagem || "Pausado.", !data.ok);
-          if (data.ok) setTimeout(() => location.reload(), 500);
-        }
-
-        async function reativarNumero(telefone) {
-          const res = await fetch("/api/reativar", {
-            method: "POST",
-            headers: headersAuth(),
-            body: JSON.stringify({ telefone })
-          });
-          const data = await res.json();
-          setFeedback(data.mensagem || "Reativado.", !data.ok);
-          if (data.ok) setTimeout(() => location.reload(), 500);
-        }
-      </script>
     </body>
     </html>
     """
     return render_template_string(
         html,
-        instancia=INSTANCIA_NOME,
-        bloqueados=bloqueados_qtd,
-        status_whatsapp=STATUS_WHATSAPP,
-        chave_padrao=CHAVE_ACESSO_PADRAO,
-        contatos=contatos,
-        pausados=pausados,
+        instancia=INSTANCE_NAME,
+        total_bloqueados=len(bloqueados_lista),
+        status_conexao=status_conexao,
+        chave_padrao=API_KEY,
+        total_contatos=len(contatos_lista),
+        contatos=contatos_lista,
+        pausados=pausados_lista,
     )
 
 
-@app.route("/api/webhook/corrigir", methods=["POST"])
-@exigir_chave
-def corrigir_webhook():
-    if not WHATSAPP_API_URL or not WHATSAPP_API_KEY:
-        return jsonify({
-            "ok": False,
-            "mensagem": "Defina WHATSAPP_API_KEY nas variáveis do Railway antes de configurar o webhook."
-        }), 400
-
-    webhook_url = request.url_root.rstrip("/") + "/webhook"
-    url = f"{WHATSAPP_API_URL}/webhook/set/{INSTANCIA_NOME}"
-    headers = {"Content-Type": "application/json", "apikey": WHATSAPP_API_KEY}
-    payload = {
-        "webhook": {
-            "enabled": True,
-            "url": webhook_url,
-            "webhookByEvents": False,
-            "events": ["MESSAGES_UPSERT", "SEND_MESSAGE"],
-        }
-    }
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=15)
-        if 200 <= resp.status_code < 300:
-            registrar_metrica("-", "WEBHOOK_ATIVADO", webhook_url)
-            return jsonify({"ok": True, "mensagem": f"Webhook oficial ativado em {webhook_url}."})
-        return jsonify({
-            "ok": False,
-            "mensagem": f"Evolution API retornou HTTP {resp.status_code}: {resp.text[:180]}"
-        }), 500
-    except Exception as exc:
-        return jsonify({"ok": False, "mensagem": f"Falha de conexão com Evolution API: {exc}"}), 500
-
-
-@app.route("/api/metricas/xlsx", methods=["GET", "POST"])
-@exigir_chave
+@app.route("/metricas", methods=["GET"])
 def baixar_metricas():
-    arquivo = gerar_arquivo_metricas_xlsx()
+    if not os.path.exists(EXCEL_FILE):
+        return jsonify({"erro": "Arquivo Excel não encontrado."}), 404
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        todas_abas = pd.read_excel(EXCEL_FILE, sheet_name=None)
+        for nome_aba, df_aba in todas_abas.items():
+            df_aba.to_excel(writer, sheet_name=nome_aba, index=False)
+    output.seek(0)
     return send_file(
-        arquivo,
+        output,
         as_attachment=True,
         download_name="metricas_sofia_oficial.xlsx",
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
 
-@app.route("/api/contatos/atualizar", methods=["POST"])
-@exigir_chave
-def atualizar_contatos():
-    contatos = obter_lista_contatos_combinada()
-    return jsonify({"ok": True, "mensagem": f"Contatos e fila atualizados ({len(contatos)} contatos)."})
-
-
-@app.route("/api/iniciar-contato", methods=["POST"])
-@exigir_chave
-def iniciar_contato():
-    dados = request.get_json(silent=True) or {}
-    telefone = normalizar_telefone(dados.get("telefone"))
-    tipo = dados.get("tipo", "menu_sofia")
-    mensagem_manual = normalizar_texto(dados.get("mensagem", ""))
-
-    if not telefone:
-        return jsonify({"ok": False, "mensagem": "Informe um número com DDD."}), 400
-
-    bloqueados = carregar_bloqueados_excel()
-    if telefone in bloqueados:
-        registrar_metrica(telefone, "BLOQUEADO_LISTA", "Tentativa de envio a número bloqueado")
-        return jsonify({"ok": False, "mensagem": f"Número {telefone} está na lista de bloqueados."}), 400
-
-    if tipo == "encerrar":
-        ok, detalhe = enviar_whatsapp_api(telefone, MENSAGEM_ENCERRAMENTO)
-        reativar_robo(telefone, "envio_encerramento_painel")
-        if not ok:
-            return jsonify({"ok": False, "mensagem": detalhe}), 500
-        return jsonify({"ok": True, "mensagem": f"Encerramento enviado para {telefone}. Robô reativado automaticamente."})
-
-    if tipo == "mensagem_manual":
-        if not mensagem_manual:
-            return jsonify({"ok": False, "mensagem": "Digite a mensagem manual antes de enviar."}), 400
-        ok, detalhe = enviar_whatsapp_api(telefone, mensagem_manual)
-        if not ok:
-            return jsonify({"ok": False, "mensagem": detalhe}), 500
-        if eh_mensagem_encerramento(mensagem_manual):
-            reativar_robo(telefone, "mensagem_manual_encerramento")
-            return jsonify({"ok": True, "mensagem": f"Mensagem de encerramento enviada para {telefone}. Robô reativado."})
-        pausar_para_humano(telefone, "mensagem_manual_painel")
-        return jsonify({"ok": True, "mensagem": f"Mensagem enviada para {telefone}. Robô pausado para atendimento humano."})
-
-    ok, detalhe = enviar_whatsapp_api(telefone, menu_sofia_texto())
-    reativar_robo(telefone, "menu_sofia_painel")
-    if not ok:
-        return jsonify({"ok": False, "mensagem": detalhe}), 500
-    return jsonify({"ok": True, "mensagem": f"Menu da Sofia enviado para {telefone}."})
-
-
-@app.route("/api/pausar", methods=["POST"])
-@exigir_chave
-def api_pausar():
-    dados = request.get_json(silent=True) or {}
-    telefone = normalizar_telefone(dados.get("telefone"))
-    if not telefone:
-        return jsonify({"ok": False, "mensagem": "Informe um número para pausar."}), 400
-    pausar_para_humano(telefone, "pausa_manual_painel")
-    return jsonify({"ok": True, "mensagem": f"Robô pausado para {telefone}."})
-
-
-@app.route("/api/reativar", methods=["POST"])
-@exigir_chave
-def api_reativar():
-    dados = request.get_json(silent=True) or {}
-    telefone = normalizar_telefone(dados.get("telefone"))
-    if not telefone:
-        return jsonify({"ok": False, "mensagem": "Informe um número para reativar."}), 400
-    reativar_robo(telefone, "reativacao_manual_painel")
-    return jsonify({"ok": True, "mensagem": f"Robô reativado para {telefone}."})
-
-
 @app.route("/webhook", methods=["POST"])
-def webhook_whatsapp():
+def webhook():
     dados = request.get_json(silent=True) or {}
-    telefone, mensagem, from_me = extrair_dados_evolution(dados)
+    data = dados.get("data") if isinstance(dados.get("data"), dict) else dados
+    key = data.get("key") or {}
+    msg_obj = data.get("message") or {}
 
-    if not telefone or not mensagem:
+    remote_jid = str(key.get("remoteJid") or dados.get("remoteJid") or "")
+    if "@g.us" in remote_jid or "status@broadcast" in remote_jid:
         return jsonify({"status": "ignorado"}), 200
 
-    bloqueados = carregar_bloqueados_excel()
-    if telefone in bloqueados:
-        registrar_metrica(telefone, "BLOQUEADO_WEBHOOK", mensagem[:60])
+    numero_bruto = remote_jid.split("@")[0] or str(dados.get("telefone") or "")
+    numero_norm = normalizar_telefone(numero_bruto)
+    numero_envio = formatar_para_envio(numero_bruto)
+    from_me = bool(key.get("fromMe", dados.get("fromMe", False)))
+
+    texto = (
+        msg_obj.get("conversation")
+        or (msg_obj.get("extendedTextMessage") or {}).get("text")
+        or dados.get("mensagem")
+        or dados.get("body")
+        or ""
+    )
+    texto = str(texto).strip()
+
+    if not numero_norm or not texto:
+        return jsonify({"status": "ignorado"}), 200
+
+    bloqueados = carregar_numeros_bloqueados()
+    if numero_norm in bloqueados:
         return jsonify({"status": "bloqueado"}), 200
 
     if from_me:
-        if eh_mensagem_encerramento(mensagem):
-            reativar_robo(telefone, "fromMe_encerramento")
-            return jsonify({"status": "reativado_por_encerramento", "telefone": telefone}), 200
+        if eh_mensagem_encerramento(texto):
+            gerenciar_estado_humano(numero_norm, acao="desativar")
+            return jsonify({"status": "reativado_por_encerramento"}), 200
         if not dados.get("enviado_pelo_bot", False):
-            pausar_para_humano(telefone, "fromMe_atendente")
-            return jsonify({"status": "pausado_por_humano", "telefone": telefone}), 200
+            gerenciar_estado_humano(numero_norm, acao="ativar")
+            return jsonify({"status": "pausado_por_humano"}), 200
         return jsonify({"status": "mensagem_bot"}), 200
 
-    conv = obter_conversa(telefone)
-    if mensagem.lower() in ("#finalizar", "0", "encerrar"):
-        resposta = responder_bot(telefone, mensagem)
-        enviar_whatsapp_api(telefone, resposta)
-        return jsonify({"status": "encerrado", "telefone": telefone, "resposta": resposta}), 200
+    if gerenciar_estado_humano(numero_norm, acao="verificar") and not eh_mensagem_encerramento(texto):
+        return jsonify({"status": "robô_pausado"}), 200
 
-    if conv["robo_pausado"]:
-        return jsonify({"status": "robô_pausado", "telefone": telefone}), 200
-
-    try:
-        resposta = responder_bot(telefone, mensagem)
-        enviar_whatsapp_api(telefone, resposta)
-        return jsonify({"status": "respondido", "telefone": telefone, "resposta": resposta}), 200
-    except Exception as exc:
-        print(f"[ERRO BOT] {telefone}: {exc}")
-        fallback = (
-            "Desculpe, não encontrei essa opção. 🤔\n\n"
-            "• Digite *menu* para ver as opções\n"
-            "• Digite *0* para encerrar"
-        )
-        enviar_whatsapp_api(telefone, fallback)
-        return jsonify({"status": "erro_tratado", "telefone": telefone, "resposta": fallback}), 200
+    resposta = consultar_excel(texto, numero_norm)
+    enviar_mensagem_whatsapp(numero_envio, resposta)
+    return jsonify({"status": "ok"}), 200
 
 
 if __name__ == "__main__":
