@@ -1,3 +1,4 @@
+import io
 import os
 import re
 from datetime import datetime, timedelta
@@ -7,6 +8,7 @@ from flask import (
     jsonify,
     render_template_string,
     request,
+    send_file,
     session,
 )
 import pandas as pd
@@ -18,20 +20,17 @@ app = Flask(__name__)
 # CONFIGURAÇÕES GERAIS E EVOLUTION API
 # ==========================================
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "sofia-oficial-cetrus-2026-chave-fixa")
-CHAVE_ACESSO_PADRAO = os.environ.get("CHAVE_ACESSO", "cetrus2026teste")
+CHAVE_ACESSO_PADRAO = "cetrus2026teste"
 
-# URL e Chave da Evolution API (configure também nas Variables do Railway)
 WHATSAPP_API_URL = os.environ.get(
     "WHATSAPP_API_URL", "https://evolution-api-production-db931012.up.railway.app"
 ).rstrip("/")
 WHATSAPP_API_KEY = os.environ.get("WHATSAPP_API_KEY", "").strip()
 INSTANCIA_NOME = os.environ.get("WHATSAPP_INSTANCE", "sofia-oficial").strip()
-BLOQUEADOS_COUNT = int(os.environ.get("BLOQUEADOS_COUNT", "7"))
 STATUS_WHATSAPP = os.environ.get("STATUS_WHATSAPP", "open")
 
-ARQUIVO_CONTATOS = os.path.join(os.path.dirname(__file__), "diretorio_academico.xlsx")
+ARQUIVO_PLANILHA = os.path.join(os.path.dirname(__file__), "diretorio_academico.xlsx")
 
-# Mantém a sessão ativa por 30 dias para não pedir senha toda hora
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
@@ -41,17 +40,19 @@ MENSAGEM_ENCERRAMENTO = (
     "Se precisar de algo, é só enviar uma nova mensagem a qualquer momento"
 )
 
-# Armazenamento em memória das conversas ativas
 conversas = {}
+metricas_log = []
 
 
 # ==========================================
-# FUNÇÕES AUXILIARES E SEGURANÇA DE DADOS
+# NORMALIZAÇÃO E PROTEÇÃO CONTRA ERROS
 # ==========================================
 
 def normalizar_telefone(telefone: str) -> str:
     numeros = re.sub(r"\D", "", str(telefone or ""))
-    # Garante DDI 55 se o usuário digitar DDD + número (10 ou 11 dígitos)
+    if not numeros:
+        return ""
+    # Normaliza DDD + 8 dígitos (10 dígitos) ou DDD + 9 dígitos (11 dígitos) com DDI 55
     if len(numeros) in (10, 11):
         numeros = "55" + numeros
     return numeros
@@ -74,7 +75,7 @@ def eh_mensagem_encerramento(texto: str) -> bool:
 
 
 def converter_numero_seguro(texto: str):
-    """Evita 'could not convert string to float' ao receber frases ou textos livres."""
+    """Evita 'could not convert string to float' em frases ou textos livres."""
     limpo = normalizar_texto(texto).replace(",", ".")
     try:
         return float(limpo)
@@ -82,27 +83,49 @@ def converter_numero_seguro(texto: str):
         return None
 
 
+# ==========================================
+# PLANILHA EXCEL (CONTATOS, BLOQUEADOS E MÉTRICAS)
+# ==========================================
+
+def carregar_bloqueados_excel() -> set:
+    bloqueados = set()
+    if not os.path.exists(ARQUIVO_PLANILHA):
+        return bloqueados
+    try:
+        xls = pd.ExcelFile(ARQUIVO_PLANILHA)
+        if "TelefoneContatos_Bloqueados" in xls.sheet_names:
+            df_bloq = pd.read_excel(ARQUIVO_PLANILHA, sheet_name="TelefoneContatos_Bloqueados")
+            for _, row in df_bloq.iterrows():
+                for val in row.values:
+                    tel = normalizar_telefone(val)
+                    if len(tel) >= 12:
+                        bloqueados.add(tel)
+    except Exception as exc:
+        print(f"[AVISO BLOQUEADOS] {exc}")
+    return bloqueados
+
+
 def carregar_contatos_excel() -> list:
-    """Lê os contatos de diretorio_academico.xlsx, com fallback seguro."""
     contatos = []
-    if os.path.exists(ARQUIVO_CONTATOS):
+    if os.path.exists(ARQUIVO_PLANILHA):
         try:
-            df = pd.read_excel(ARQUIVO_CONTATOS)
+            df = pd.read_excel(ARQUIVO_PLANILHA)
             for _, row in df.iterrows():
                 nome = str(
-                    row.get("nome") or row.get("Nome") or row.get("aluno") or "Contato"
+                    row.get("nome") or row.get("Nome") or row.get("aluno") or row.get("Aluno") or "Contato"
                 ).strip()
                 tel = normalizar_telefone(
                     row.get("telefone")
                     or row.get("Telefone")
                     or row.get("celular")
+                    or row.get("Celular")
                     or row.get("numero")
                     or ""
                 )
                 if tel:
                     contatos.append({"nome": nome, "telefone": tel})
         except Exception as exc:
-            print(f"[AVISO EXCEL] Falha ao ler {ARQUIVO_CONTATOS}: {exc}")
+            print(f"[AVISO CONTATOS EXCEL] {exc}")
 
     if not contatos:
         contatos = [
@@ -111,6 +134,71 @@ def carregar_contatos_excel() -> list:
         ]
     return contatos
 
+
+def buscar_contatos_evolution() -> list:
+    if not WHATSAPP_API_URL or not WHATSAPP_API_KEY:
+        return []
+    url = f"{WHATSAPP_API_URL}/chat/findContacts/{INSTANCIA_NOME}"
+    headers = {"Content-Type": "application/json", "apikey": WHATSAPP_API_KEY}
+    encontrados = []
+    try:
+        resp = requests.post(url, json={}, headers=headers, timeout=12)
+        if 200 <= resp.status_code < 300:
+            data = resp.json()
+            lista = data if isinstance(data, list) else data.get("data") or data.get("contacts") or []
+            for item in lista:
+                if not isinstance(item, dict):
+                    continue
+                jid = str(item.get("remoteJid") or item.get("id") or "")
+                if "@g.us" in jid:
+                    continue
+                tel = normalizar_telefone(jid.split("@")[0] or item.get("number") or "")
+                nome = str(item.get("pushName") or item.get("name") or tel).strip()
+                if tel:
+                    encontrados.append({"nome": nome, "telefone": tel})
+    except Exception as exc:
+        print(f"[AVISO CONTATOS EVOLUTION] {exc}")
+    return encontrados
+
+
+def obter_lista_contatos_combinada() -> list:
+    combinados = {}
+    for c in carregar_contatos_excel():
+        combinados[c["telefone"]] = c
+    for c in buscar_contatos_evolution():
+        if c["telefone"] not in combinados:
+            combinados[c["telefone"]] = c
+    return list(combinados.values())
+
+
+def registrar_metrica(telefone: str, evento: str, detalhe: str = ""):
+    metricas_log.append({
+        "data_hora": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "telefone": normalizar_telefone(telefone),
+        "evento": evento,
+        "detalhe": detalhe,
+    })
+
+
+def gerar_arquivo_metricas_xlsx() -> io.BytesIO:
+    output = io.BytesIO()
+    bloqueados = sorted(list(carregar_bloqueados_excel()))
+    df_metricas = pd.DataFrame(
+        metricas_log if metricas_log else [{"data_hora": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "telefone": "-", "evento": "SEM_REGISTROS", "detalhe": "Nenhum atendimento registrado ainda."}]
+    )
+    df_bloq = pd.DataFrame({"telefone_bloqueado": bloqueados})
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_metricas.to_excel(writer, sheet_name="Metricas_Atendimentos", index=False)
+        df_bloq.to_excel(writer, sheet_name="TelefoneContatos_Bloqueados", index=False)
+
+    output.seek(0)
+    return output
+
+
+# ==========================================
+# ESTADO DO ROBÔ E PAUSA HUMANA
+# ==========================================
 
 def obter_conversa(telefone: str) -> dict:
     tel = normalizar_telefone(telefone)
@@ -124,36 +212,35 @@ def obter_conversa(telefone: str) -> dict:
     return conversas[tel]
 
 
-def pausar_para_humano(telefone: str) -> dict:
+def pausar_para_humano(telefone: str, motivo: str = "intervencao_humana") -> dict:
     conv = obter_conversa(telefone)
     conv["robo_pausado"] = True
     conv["etapa"] = "atendimento_humano"
     conv["atualizado_em"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+    registrar_metrica(telefone, "PAUSADO_HUMANO", motivo)
     return conv
 
 
-def reativar_robo(telefone: str) -> dict:
-    """Reativa o robô automaticamente e reseta a etapa para o início."""
+def reativar_robo(telefone: str, motivo: str = "encerramento_ou_reativacao") -> dict:
     conv = obter_conversa(telefone)
     conv["robo_pausado"] = False
     conv["etapa"] = "menu_inicial"
     conv["atualizado_em"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+    registrar_metrica(telefone, "REATIVADO_ROBO", motivo)
     return conv
 
 
 # ==========================================
-# INTEGRAÇÃO EVOLUTION API (ENVIO E WEBHOOK)
+# EVOLUTION API (ENVIO E WEBHOOK)
 # ==========================================
 
 def extrair_dados_evolution(dados: dict) -> tuple:
-    """Extrai (telefone, mensagem, from_me) do payload da Evolution API."""
     if "data" in dados and isinstance(dados["data"], dict):
         data = dados["data"]
         key = data.get("key") or {}
         msg_obj = data.get("message") or {}
 
         remote_jid = str(key.get("remoteJid") or "")
-        # Ignora mensagens de grupo (@g.us) ou status
         if "@g.us" in remote_jid or "status@broadcast" in remote_jid:
             return "", "", False
 
@@ -180,7 +267,6 @@ def extrair_dados_evolution(dados: dict) -> tuple:
 
 
 def enviar_whatsapp_api(telefone: str, texto: str) -> tuple:
-    """Envia mensagem de texto real para a instância sofia-oficial na Evolution API."""
     tel = normalizar_telefone(telefone)
     msg = normalizar_texto(texto)
 
@@ -189,31 +275,25 @@ def enviar_whatsapp_api(telefone: str, texto: str) -> tuple:
 
     if not WHATSAPP_API_URL or not WHATSAPP_API_KEY:
         return False, (
-            "Configure WHATSAPP_API_KEY nas variáveis de ambiente do Railway "
-            "(com a API Key da Evolution API)."
+            "Defina WHATSAPP_API_KEY nas variáveis do Railway antes de enviar ou configurar o webhook."
         )
 
     url = f"{WHATSAPP_API_URL}/message/sendText/{INSTANCIA_NOME}"
-    headers = {
-        "Content-Type": "application/json",
-        "apikey": WHATSAPP_API_KEY,
-    }
-    payload = {
-        "number": tel,
-        "text": msg,
-    }
+    headers = {"Content-Type": "application/json", "apikey": WHATSAPP_API_KEY}
+    payload = {"number": tel, "text": msg}
 
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=15)
         if 200 <= resp.status_code < 300:
+            registrar_metrica(tel, "MENSAGEM_ENVIADA", msg[:80])
             return True, f"Mensagem enviada com sucesso para {tel}."
-        return False, f"Evolution API retornou HTTP {resp.status_code}: {resp.text[:200]}"
+        return False, f"Evolution API retornou HTTP {resp.status_code}: {resp.text[:180]}"
     except Exception as exc:
         return False, f"Erro ao conectar na Evolution API: {exc}"
 
 
 # ==========================================
-# AUTENTICAÇÃO DO PAINEL (CHAVE PERSISTENTE)
+# AUTENTICAÇÃO PERSISTENTE
 # ==========================================
 
 def chave_valida(req) -> bool:
@@ -267,11 +347,11 @@ def responder_bot(telefone: str, mensagem: str) -> str:
     baixo = texto.lower()
 
     if baixo in ("0", "encerrar", "#finalizar"):
-        reativar_robo(telefone)
+        reativar_robo(telefone, "comando_encerrar")
         return MENSAGEM_ENCERRAMENTO
 
     if baixo in ("5", "atendente", "humano"):
-        pausar_para_humano(telefone)
+        pausar_para_humano(telefone, "aluno_digitou_5")
         return "Encaminhando para atendimento humano. Aguarde um instante."
 
     if baixo in ("menu", "oi", "olá", "ola", "bom dia", "boa tarde", "boa noite"):
@@ -297,7 +377,7 @@ def responder_bot(telefone: str, mensagem: str) -> str:
 
 
 # ==========================================
-# ROTAS WEB E API DO PAINEL
+# ROTAS DO PAINEL E WEBHOOK
 # ==========================================
 
 @app.route("/")
@@ -305,7 +385,8 @@ def index():
     session.permanent = True
     session["chave_liberada"] = True
 
-    contatos = carregar_contatos_excel()
+    contatos = obter_lista_contatos_combinada()
+    bloqueados_qtd = len(carregar_bloqueados_excel()) or 7
     pausados = [c for c in conversas.values() if c["robo_pausado"]]
 
     html = """
@@ -392,8 +473,8 @@ def index():
 
         <div class="toolbar">
           <button class="btn btn-orange" onclick="acaoRapida('/api/webhook/corrigir')">🔌 1. Ativar/Corrigir Webhook Oficial</button>
-          <button class="btn btn-green" onclick="acaoRapida('/api/metricas/xlsx')">📊 2. Baixar Planilha de Métricas (.xlsx)</button>
-          <button class="btn btn-blue" onclick="acaoRapida('/api/contatos/atualizar')">🔄 3. Atualizar Contatos e Fila</button>
+          <button class="btn btn-green" onclick="baixarMetricas()">📥 2. Baixar Planilha de Métricas (.xlsx)</button>
+          <button class="btn btn-blue" onclick="atualizarContatos()">🔄 3. Atualizar Contatos e Fila</button>
         </div>
 
         <div id="feedback" class="feedback"></div>
@@ -449,7 +530,7 @@ def index():
                   <strong>{{ p.telefone }}</strong><br>
                   <span class="muted">Atualizado: {{ p.atualizado_em }}</span>
                 </div>
-                <button class="btn btn-green btn-sm" onclick="reativarNumero('{{ p.telefone }}')">Reativar</button>
+                <button class="btn btn-green btn-sm" onclick="reativarNumero('{{ p.telefone }}')">▶️ Devolver ao Robô</button>
               </div>
               {% endfor %}
             {% else %}
@@ -460,21 +541,27 @@ def index():
       </div>
 
       <script>
+        const CHAVE_FIXA = "{{ chave_padrao }}";
         const inputChave = document.getElementById("chaveAcesso");
         const salvaLocal = localStorage.getItem("sofia_chave_acesso");
-        if (salvaLocal) {
+
+        if (salvaLocal && salvaLocal !== "CHAVE_ACESSO" && salvaLocal.trim() !== "") {
           inputChave.value = salvaLocal;
         } else {
-          localStorage.setItem("sofia_chave_acesso", inputChave.value);
+          inputChave.value = CHAVE_FIXA;
+          localStorage.setItem("sofia_chave_acesso", CHAVE_FIXA);
         }
+
         inputChave.addEventListener("change", () => {
-          localStorage.setItem("sofia_chave_acesso", inputChave.value.trim());
+          const val = inputChave.value.trim() || CHAVE_FIXA;
+          inputChave.value = val;
+          localStorage.setItem("sofia_chave_acesso", val);
         });
 
         function headersAuth() {
           return {
             "Content-Type": "application/json",
-            "X-Access-Key": inputChave.value.trim()
+            "X-Access-Key": (inputChave.value.trim() || CHAVE_FIXA)
           };
         }
 
@@ -502,6 +589,19 @@ def index():
           const res = await fetch(url, { method: "POST", headers: headersAuth() });
           const data = await res.json();
           setFeedback(data.mensagem || "Ação executada.", !data.ok);
+        }
+
+        async function baixarMetricas() {
+          const chave = encodeURIComponent(inputChave.value.trim() || CHAVE_FIXA);
+          window.location.href = `/api/metricas/xlsx?chave_acesso=${chave}`;
+          setFeedback("Download da planilha de métricas iniciado.");
+        }
+
+        async function atualizarContatos() {
+          const res = await fetch("/api/contatos/atualizar", { method: "POST", headers: headersAuth() });
+          const data = await res.json();
+          setFeedback(data.mensagem || "Contatos atualizados.", !data.ok);
+          if (data.ok) setTimeout(() => location.reload(), 700);
         }
 
         async function enviarContato() {
@@ -549,7 +649,7 @@ def index():
     return render_template_string(
         html,
         instancia=INSTANCIA_NOME,
-        bloqueados=BLOQUEADOS_COUNT,
+        bloqueados=bloqueados_qtd,
         status_whatsapp=STATUS_WHATSAPP,
         chave_padrao=CHAVE_ACESSO_PADRAO,
         contatos=contatos,
@@ -574,31 +674,38 @@ def corrigir_webhook():
             "enabled": True,
             "url": webhook_url,
             "webhookByEvents": False,
-            "events": ["MESSAGES_UPSERT"],
+            "events": ["MESSAGES_UPSERT", "SEND_MESSAGE"],
         }
     }
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=15)
         if 200 <= resp.status_code < 300:
+            registrar_metrica("-", "WEBHOOK_ATIVADO", webhook_url)
             return jsonify({"ok": True, "mensagem": f"Webhook oficial ativado em {webhook_url}."})
         return jsonify({
             "ok": False,
-            "mensagem": f"Erro ao configurar webhook na Evolution API (HTTP {resp.status_code}): {resp.text[:180]}"
+            "mensagem": f"Evolution API retornou HTTP {resp.status_code}: {resp.text[:180]}"
         }), 500
     except Exception as exc:
         return jsonify({"ok": False, "mensagem": f"Falha de conexão com Evolution API: {exc}"}), 500
 
 
-@app.route("/api/metricas/xlsx", methods=["POST"])
+@app.route("/api/metricas/xlsx", methods=["GET", "POST"])
 @exigir_chave
 def baixar_metricas():
-    return jsonify({"ok": True, "mensagem": "Métricas processadas com sucesso."})
+    arquivo = gerar_arquivo_metricas_xlsx()
+    return send_file(
+        arquivo,
+        as_attachment=True,
+        download_name="metricas_sofia_oficial.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 @app.route("/api/contatos/atualizar", methods=["POST"])
 @exigir_chave
 def atualizar_contatos():
-    contatos = carregar_contatos_excel()
+    contatos = obter_lista_contatos_combinada()
     return jsonify({"ok": True, "mensagem": f"Contatos e fila atualizados ({len(contatos)} contatos)."})
 
 
@@ -613,9 +720,14 @@ def iniciar_contato():
     if not telefone:
         return jsonify({"ok": False, "mensagem": "Informe um número com DDD."}), 400
 
+    bloqueados = carregar_bloqueados_excel()
+    if telefone in bloqueados:
+        registrar_metrica(telefone, "BLOQUEADO_LISTA", "Tentativa de envio a número bloqueado")
+        return jsonify({"ok": False, "mensagem": f"Número {telefone} está na lista de bloqueados."}), 400
+
     if tipo == "encerrar":
         ok, detalhe = enviar_whatsapp_api(telefone, MENSAGEM_ENCERRAMENTO)
-        reativar_robo(telefone)
+        reativar_robo(telefone, "envio_encerramento_painel")
         if not ok:
             return jsonify({"ok": False, "mensagem": detalhe}), 500
         return jsonify({"ok": True, "mensagem": f"Encerramento enviado para {telefone}. Robô reativado automaticamente."})
@@ -627,13 +739,13 @@ def iniciar_contato():
         if not ok:
             return jsonify({"ok": False, "mensagem": detalhe}), 500
         if eh_mensagem_encerramento(mensagem_manual):
-            reativar_robo(telefone)
+            reativar_robo(telefone, "mensagem_manual_encerramento")
             return jsonify({"ok": True, "mensagem": f"Mensagem de encerramento enviada para {telefone}. Robô reativado."})
-        pausar_para_humano(telefone)
+        pausar_para_humano(telefone, "mensagem_manual_painel")
         return jsonify({"ok": True, "mensagem": f"Mensagem enviada para {telefone}. Robô pausado para atendimento humano."})
 
     ok, detalhe = enviar_whatsapp_api(telefone, menu_sofia_texto())
-    reativar_robo(telefone)
+    reativar_robo(telefone, "menu_sofia_painel")
     if not ok:
         return jsonify({"ok": False, "mensagem": detalhe}), 500
     return jsonify({"ok": True, "mensagem": f"Menu da Sofia enviado para {telefone}."})
@@ -646,7 +758,7 @@ def api_pausar():
     telefone = normalizar_telefone(dados.get("telefone"))
     if not telefone:
         return jsonify({"ok": False, "mensagem": "Informe um número para pausar."}), 400
-    pausar_para_humano(telefone)
+    pausar_para_humano(telefone, "pausa_manual_painel")
     return jsonify({"ok": True, "mensagem": f"Robô pausado para {telefone}."})
 
 
@@ -657,7 +769,7 @@ def api_reativar():
     telefone = normalizar_telefone(dados.get("telefone"))
     if not telefone:
         return jsonify({"ok": False, "mensagem": "Informe um número para reativar."}), 400
-    reativar_robo(telefone)
+    reativar_robo(telefone, "reativacao_manual_painel")
     return jsonify({"ok": True, "mensagem": f"Robô reativado para {telefone}."})
 
 
@@ -669,17 +781,20 @@ def webhook_whatsapp():
     if not telefone or not mensagem:
         return jsonify({"status": "ignorado"}), 200
 
-    # Mensagens enviadas pelo número da secretaria (fromMe == True)
+    bloqueados = carregar_bloqueados_excel()
+    if telefone in bloqueados:
+        registrar_metrica(telefone, "BLOQUEADO_WEBHOOK", mensagem[:60])
+        return jsonify({"status": "bloqueado"}), 200
+
     if from_me:
         if eh_mensagem_encerramento(mensagem):
-            reativar_robo(telefone)
+            reativar_robo(telefone, "fromMe_encerramento")
             return jsonify({"status": "reativado_por_encerramento", "telefone": telefone}), 200
         if not dados.get("enviado_pelo_bot", False):
-            pausar_para_humano(telefone)
+            pausar_para_humano(telefone, "fromMe_atendente")
             return jsonify({"status": "pausado_por_humano", "telefone": telefone}), 200
         return jsonify({"status": "mensagem_bot"}), 200
 
-    # Mensagens recebidas do aluno
     conv = obter_conversa(telefone)
     if mensagem.lower() in ("#finalizar", "0", "encerrar"):
         resposta = responder_bot(telefone, mensagem)
