@@ -5,19 +5,27 @@ from functools import wraps
 from flask import (
     Flask,
     jsonify,
-    redirect,
     render_template_string,
     request,
     session,
-    url_for,
 )
+import pandas as pd
+import requests
 
 app = Flask(__name__)
 
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "sofia-oficial-cetrus-2026-chave-fixa")
 CHAVE_ACESSO_PADRAO = os.environ.get("CHAVE_ACESSO", "cetrus2026teste")
 
-# Sessão persistente por 30 dias para evitar pedir senha repetidamente
+# Configurações da API do WhatsApp (configure no Railway ou .env)
+WHATSAPP_API_URL = os.environ.get("WHATSAPP_API_URL", "").rstrip("/")
+WHATSAPP_API_KEY = os.environ.get("WHATSAPP_API_KEY", "")
+INSTANCIA_NOME = os.environ.get("WHATSAPP_INSTANCE", "sofia-oficial")
+BLOQUEADOS_COUNT = int(os.environ.get("BLOQUEADOS_COUNT", "7"))
+STATUS_WHATSAPP = os.environ.get("STATUS_WHATSAPP", "open")
+
+ARQUIVO_CONTATOS = os.path.join(os.path.dirname(__file__), "diretorio_academico.xlsx")
+
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
@@ -27,29 +35,82 @@ MENSAGEM_ENCERRAMENTO = (
     "Se precisar de algo, é só enviar uma nova mensagem a qualquer momento"
 )
 
-INSTANCIA_NOME = "sofia-oficial"
-BLOQUEADOS_COUNT = 7
-STATUS_WHATSAPP = "open"
-
-# Contatos de exemplo (substitua pela sua fonte/API de contatos quando integrar)
-CONTATOS_SALVOS = [
-    {"nome": "Mayara Cetrus Semi", "telefone": "5511999990001"},
-    {"nome": "Aluno Teste Secretaria", "telefone": "5511957735761"},
-]
-
-# Estado das conversas: telefone -> dict
-# robô_pausado = True significa que está em "Atendimentos Humanos (Robô Pausado)"
 conversas = {}
 
 
 def normalizar_telefone(telefone: str) -> str:
-    return re.sub(r"\D", "", str(telefone or ""))
+    numeros = re.sub(r"\D", "", str(telefone or ""))
+    # Garante DDI 55 se o usuário digitar DDD + número (10 ou 11 dígitos)
+    if len(numeros) in (10, 11):
+        numeros = "55" + numeros
+    return numeros
 
 
 def normalizar_texto(texto: str) -> str:
     if not texto:
         return ""
     return str(texto).replace("\\n", "\n").strip()
+
+
+def carregar_contatos_excel() -> list[dict]:
+    """Lê os contatos de diretorio_academico.xlsx, com fallback seguro."""
+    contatos = []
+    if os.path.exists(ARQUIVO_CONTATOS):
+        try:
+            df = pd.read_excel(ARQUIVO_CONTATOS)
+            for _, row in df.iterrows():
+                nome = str(row.get("nome") or row.get("Nome") or row.get("aluno") or "Contato").strip()
+                tel = normalizar_telefone(
+                    row.get("telefone") or row.get("Telefone") or row.get("celular") or row.get("numero") or ""
+                )
+                if tel:
+                    contatos.append({"nome": nome, "telefone": tel})
+        except Exception as exc:
+            print(f"[AVISO EXCEL] Falha ao ler {ARQUIVO_CONTATOS}: {exc}")
+
+    if not contatos:
+        contatos = [
+            {"nome": "Mayara Cetrus Semi", "telefone": "5511999990001"},
+            {"nome": "Aluno Teste Secretaria", "telefone": "5511957735761"},
+        ]
+    return contatos
+
+
+def enviar_whatsapp_api(telefone: str, texto: str) -> tuple[bool, str]:
+    """
+    Envia mensagem real para a API do WhatsApp.
+    Ajuste o endpoint/payload conforme o provedor usado na instância sofia-oficial.
+    """
+    tel = normalizar_telefone(telefone)
+    msg = normalizar_texto(texto)
+
+    if not tel or not msg:
+        return False, "Telefone ou mensagem vazios."
+
+    if not WHATSAPP_API_URL or not WHATSAPP_API_KEY:
+        return False, (
+            "API do WhatsApp não configurada no servidor. "
+            "Defina WHATSAPP_API_URL e WHATSAPP_API_KEY nas variáveis de ambiente."
+        )
+
+    url = f"{WHATSAPP_API_URL}/message/sendText/{INSTANCIA_NOME}"
+    headers = {
+        "Content-Type": "application/json",
+        "apikey": WHATSAPP_API_KEY,
+        "Authorization": f"Bearer {WHATSAPP_API_KEY}",
+    }
+    payload = {
+        "number": tel,
+        "text": msg,
+    }
+
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        if 200 <= resp.status_code < 300:
+            return True, "Mensagem enviada com sucesso."
+        return False, f"Falha na API WhatsApp (HTTP {resp.status_code}): {resp.text[:200]}"
+    except Exception as exc:
+        return False, f"Erro de conexão com a API WhatsApp: {exc}"
 
 
 def eh_mensagem_encerramento(texto: str) -> bool:
@@ -63,7 +124,6 @@ def eh_mensagem_encerramento(texto: str) -> bool:
 
 
 def converter_numero_seguro(texto: str):
-    """Evita 'could not convert string to float' ao receber frases ou textos livres."""
     limpo = normalizar_texto(texto).replace(",", ".")
     try:
         return float(limpo)
@@ -92,7 +152,6 @@ def pausar_para_humano(telefone: str) -> dict:
 
 
 def reativar_robo(telefone: str) -> dict:
-    """Reativa o robô automaticamente e reseta a etapa para evitar erro de tipo."""
     conv = obter_conversa(telefone)
     conv["robo_pausado"] = False
     conv["etapa"] = "menu_inicial"
@@ -124,10 +183,21 @@ def exigir_chave(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
         if not chave_valida(request):
-            return jsonify({"ok": False, "erro": "Chave de acesso inválida."}), 401
+            return jsonify({"ok": False, "mensagem": "Chave de acesso inválida."}), 401
         return f(*args, **kwargs)
 
     return wrapper
+
+
+def menu_sofia_texto() -> str:
+    return (
+        "Olá! Sou a *Sofia*, assistente acadêmica.\n\n"
+        "1 - Provas e Avaliações\n"
+        "2 - Calendário de Aulas\n"
+        "3 - Secretaria Acadêmica\n"
+        "5 - Falar com Atendente\n"
+        "0 - Encerrar"
+    )
 
 
 def responder_bot(telefone: str, mensagem: str) -> str:
@@ -145,14 +215,7 @@ def responder_bot(telefone: str, mensagem: str) -> str:
 
     if baixo in ("menu", "oi", "olá", "ola", "bom dia", "boa tarde", "boa noite"):
         conv["etapa"] = "menu_inicial"
-        return (
-            "Olá! Sou a *Sofia*, assistente acadêmica.\n\n"
-            "1 - Provas e Avaliações\n"
-            "2 - Calendário de Aulas\n"
-            "3 - Secretaria Acadêmica\n"
-            "5 - Falar com Atendente\n"
-            "0 - Encerrar"
-        )
+        return menu_sofia_texto()
 
     opcao = converter_numero_seguro(texto)
     if opcao == 1:
@@ -174,10 +237,10 @@ def responder_bot(telefone: str, mensagem: str) -> str:
 
 @app.route("/")
 def index():
-    # Libera automaticamente a sessão com a chave padrão para não exigir redigitação
     session.permanent = True
     session["chave_liberada"] = True
 
+    contatos = carregar_contatos_excel()
     pausados = [c for c in conversas.values() if c["robo_pausado"]]
 
     html = """
@@ -238,7 +301,7 @@ def index():
           display: flex; justify-content: space-between; align-items: center;
           padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 7px; margin-bottom: 8px;
         }
-        .feedback { margin-top: 12px; font-size: 0.9rem; font-weight: 600; color: #0f766e; }
+        .feedback { margin-top: 12px; font-size: 0.92rem; font-weight: 600; color: #0f766e; }
         @media (max-width: 850px) {
           .toolbar, .grid-2 { grid-template-columns: 1fr; }
         }
@@ -350,8 +413,10 @@ def index():
           };
         }
 
-        function setFeedback(msg) {
-          document.getElementById("feedback").textContent = msg;
+        function setFeedback(msg, isErro = false) {
+          const el = document.getElementById("feedback");
+          el.style.color = isErro ? "#dc2626" : "#0f766e";
+          el.textContent = msg;
         }
 
         function filtrarContatos() {
@@ -371,7 +436,7 @@ def index():
         async function acaoRapida(url) {
           const res = await fetch(url, { method: "POST", headers: headersAuth() });
           const data = await res.json();
-          setFeedback(data.mensagem || "Ação executada.");
+          setFeedback(data.mensagem || "Ação executada.", !data.ok);
         }
 
         async function enviarContato() {
@@ -384,8 +449,10 @@ def index():
             body: JSON.stringify({ telefone, tipo, mensagem })
           });
           const data = await res.json();
-          setFeedback(data.mensagem || "Enviado.");
-          setTimeout(() => location.reload(), 600);
+          setFeedback(data.mensagem || "Enviado.", !data.ok);
+          if (data.ok) {
+            setTimeout(() => location.reload(), 900);
+          }
         }
 
         async function pausarNumero() {
@@ -396,8 +463,8 @@ def index():
             body: JSON.stringify({ telefone })
           });
           const data = await res.json();
-          setFeedback(data.mensagem || "Pausado.");
-          setTimeout(() => location.reload(), 400);
+          setFeedback(data.mensagem || "Pausado.", !data.ok);
+          if (data.ok) setTimeout(() => location.reload(), 500);
         }
 
         async function reativarNumero(telefone) {
@@ -407,8 +474,8 @@ def index():
             body: JSON.stringify({ telefone })
           });
           const data = await res.json();
-          setFeedback(data.mensagem || "Reativado.");
-          setTimeout(() => location.reload(), 400);
+          setFeedback(data.mensagem || "Reativado.", !data.ok);
+          if (data.ok) setTimeout(() => location.reload(), 500);
         }
       </script>
     </body>
@@ -420,7 +487,7 @@ def index():
         bloqueados=BLOQUEADOS_COUNT,
         status_whatsapp=STATUS_WHATSAPP,
         chave_padrao=CHAVE_ACESSO_PADRAO,
-        contatos=CONTATOS_SALVOS,
+        contatos=contatos,
         pausados=pausados,
     )
 
@@ -440,7 +507,8 @@ def baixar_metricas():
 @app.route("/api/contatos/atualizar", methods=["POST"])
 @exigir_chave
 def atualizar_contatos():
-    return jsonify({"ok": True, "mensagem": f"Contatos e fila atualizados ({len(CONTATOS_SALVOS)} contatos)."})
+    contatos = carregar_contatos_excel()
+    return jsonify({"ok": True, "mensagem": f"Contatos e fila atualizados ({len(contatos)} contatos)."})
 
 
 @app.route("/api/iniciar-contato", methods=["POST"])
@@ -455,17 +523,28 @@ def iniciar_contato():
         return jsonify({"ok": False, "mensagem": "Informe um número com DDD."}), 400
 
     if tipo == "encerrar":
+        ok, detalhe = enviar_whatsapp_api(telefone, MENSAGEM_ENCERRAMENTO)
         reativar_robo(telefone)
+        if not ok:
+            return jsonify({"ok": False, "mensagem": detalhe}), 500
         return jsonify({"ok": True, "mensagem": f"Encerramento enviado para {telefone}. Robô reativado automaticamente."})
 
-    if tipo == "mensagem_manual" and mensagem_manual:
+    if tipo == "mensagem_manual":
+        if not mensagem_manual:
+            return jsonify({"ok": False, "mensagem": "Digite a mensagem manual antes de enviar."}), 400
+        ok, detalhe = enviar_whatsapp_api(telefone, mensagem_manual)
+        if not ok:
+            return jsonify({"ok": False, "mensagem": detalhe}), 500
         if eh_mensagem_encerramento(mensagem_manual):
             reativar_robo(telefone)
-            return jsonify({"ok": True, "mensagem": f"Mensagem de encerramento enviada para {telefone}. Robô reativado automaticamente."})
+            return jsonify({"ok": True, "mensagem": f"Mensagem de encerramento enviada para {telefone}. Robô reativado."})
         pausar_para_humano(telefone)
-        return jsonify({"ok": True, "mensagem": f"Mensagem manual enviada para {telefone}. Robô pausado para atendimento humano."})
+        return jsonify({"ok": True, "mensagem": f"Mensagem enviada para {telefone}. Robô pausado para atendimento humano."})
 
+    ok, detalhe = enviar_whatsapp_api(telefone, menu_sofia_texto())
     reativar_robo(telefone)
+    if not ok:
+        return jsonify({"ok": False, "mensagem": detalhe}), 500
     return jsonify({"ok": True, "mensagem": f"Menu da Sofia enviado para {telefone}."})
 
 
@@ -505,22 +584,19 @@ def webhook_whatsapp():
     if not telefone or not mensagem:
         return jsonify({"status": "ignorado"}), 200
 
-    # Mensagem enviada pelo atendente / WhatsApp
     if from_me:
         if eh_mensagem_encerramento(mensagem):
             reativar_robo(telefone)
             return jsonify({"status": "reativado_por_encerramento", "telefone": telefone}), 200
-
         if not dados.get("enviado_pelo_bot", False):
             pausar_para_humano(telefone)
             return jsonify({"status": "pausado_por_humano", "telefone": telefone}), 200
-
         return jsonify({"status": "mensagem_bot"}), 200
 
-    # Mensagem recebida do aluno
     conv = obter_conversa(telefone)
     if mensagem.lower() in ("#finalizar", "0", "encerrar"):
         resposta = responder_bot(telefone, mensagem)
+        enviar_whatsapp_api(telefone, resposta)
         return jsonify({"status": "encerrado", "telefone": telefone, "resposta": resposta}), 200
 
     if conv["robo_pausado"]:
@@ -528,14 +604,13 @@ def webhook_whatsapp():
 
     try:
         resposta = responder_bot(telefone, mensagem)
+        enviar_whatsapp_api(telefone, resposta)
         return jsonify({"status": "respondido", "telefone": telefone, "resposta": resposta}), 200
     except Exception as exc:
         print(f"[ERRO BOT] {telefone}: {exc}")
-        return jsonify({
-            "status": "erro_tratado",
-            "telefone": telefone,
-            "resposta": "Desculpe, não encontrei essa opção. 🤔\n\n• Digite *menu* para ver as opções\n• Digite *0* para encerrar",
-        }), 200
+        fallback = "Desculpe, não encontrei essa opção. 🤔\n\n• Digite *menu* para ver as opções\n• Digite *0* para encerrar"
+        enviar_whatsapp_api(telefone, fallback)
+        return jsonify({"status": "erro_tratado", "telefone": telefone, "resposta": fallback}), 200
 
 
 if __name__ == "__main__":
