@@ -1,7 +1,6 @@
 import io
 import os
 from datetime import datetime, timedelta, timezone
-from functools import wraps
 
 from flask import (
     Flask,
@@ -170,7 +169,7 @@ def buscar_contatos_whatsapp():
             if isinstance(lista, list):
                 for item in lista:
                     jid = item.get("remoteJid") or item.get("id") or ""
-                    if "@s.whatsapp.net" in jid:
+                    if "@s.whatsapp.net" in jid or "@lid" in jid:
                         num = jid.split("@")[0]
                         nome = (
                             item.get("pushName")
@@ -194,7 +193,7 @@ def buscar_contatos_whatsapp():
             if isinstance(chats, list):
                 for chat in chats:
                     jid = chat.get("remoteJid") or chat.get("id") or ""
-                    if "@s.whatsapp.net" in jid:
+                    if "@s.whatsapp.net" in jid or "@lid" in jid:
                         num = jid.split("@")[0]
                         if num not in contatos_unicos:
                             nome = chat.get("name") or chat.get("pushName") or num
@@ -237,7 +236,7 @@ def carregar_numeros_bloqueados():
         return []
 
 
-def gerenciar_estado_humano(numero_norm, acao="verificar"):
+def gerenciar_estado_humano(numero_norm, acao="verificar", nome_aluno="Aluno WhatsApp"):
     if not numero_norm:
         return False
 
@@ -297,7 +296,7 @@ def gerenciar_estado_humano(numero_norm, acao="verificar"):
                     [
                         {
                             "ID_Usuario": numero_norm,
-                            "Nome_Aluno": "Aluno WhatsApp",
+                            "Nome_Aluno": nome_aluno or "Aluno WhatsApp",
                             "Status": "Ativo",
                             "Ultima_Interacao": agora_brasil(),
                             "Etapa": etapa_atual,
@@ -595,7 +594,7 @@ def consultar_excel(pergunta, numero_aluno_norm):
             "• Digite *0* para encerrar o atendimento"
         )
 
-    except Exception as e:
+    except Exception:
         return (
             "Desculpe, não encontrei essa opção no diretório acadêmico. 🤔\n\n"
             "• Digite *menu* para ver as opções disponíveis\n"
@@ -627,6 +626,50 @@ def enviar_mensagem_whatsapp(numero_destino, texto_resposta):
     except Exception as e:
         print(f"[ERRO] Falha ao enviar mensagem: {e}")
         return None
+
+
+def extrair_dados_webhook(dados):
+    data = dados.get("data") if isinstance(dados.get("data"), dict) else dados
+    if isinstance(data, list) and data:
+        data = data[0]
+
+    key = data.get("key") or {}
+    msg_obj = data.get("message") or {}
+
+    remote_jid = str(
+        key.get("remoteJid")
+        or key.get("remoteJidAlt")
+        or data.get("remoteJid")
+        or dados.get("remoteJid")
+        or ""
+    )
+
+    if "@g.us" in remote_jid or "status@broadcast" in remote_jid:
+        return "", "", "", "", False
+
+    parte_numero = remote_jid.split("@")[0] if "@" in remote_jid else remote_jid
+    numero_bruto = parte_numero or str(
+        data.get("senderPn")
+        or dados.get("telefone")
+        or dados.get("number")
+        or ""
+    )
+    numero_norm = normalizar_telefone(numero_bruto)
+    numero_envio = formatar_para_envio(numero_bruto)
+    nome_push = str(data.get("pushName") or dados.get("pushName") or "Aluno Novo").strip()
+    from_me = bool(key.get("fromMe", dados.get("fromMe", False)))
+
+    texto = (
+        msg_obj.get("conversation")
+        or (msg_obj.get("extendedTextMessage") or {}).get("text")
+        or (msg_obj.get("buttonsResponseMessage") or {}).get("selectedDisplayText")
+        or (msg_obj.get("listResponseMessage") or {}).get("title")
+        or dados.get("mensagem")
+        or dados.get("body")
+        or dados.get("text")
+        or ""
+    )
+    return numero_norm, numero_envio, nome_push, str(texto).strip(), from_me
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -939,50 +982,31 @@ def baixar_metricas():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     dados = request.get_json(silent=True) or {}
-    data = dados.get("data") if isinstance(dados.get("data"), dict) else dados
-    key = data.get("key") or {}
-    msg_obj = data.get("message") or {}
+    numero_norm, numero_envio, nome_push, texto, from_me = extrair_dados_webhook(dados)
 
-    remote_jid = str(key.get("remoteJid") or dados.get("remoteJid") or "")
-    if "@g.us" in remote_jid or "status@broadcast" in remote_jid:
-        return jsonify({"status": "ignorado"}), 200
+    if not numero_norm or not numero_envio or not texto:
+        return jsonify({"status": "ignorado", "motivo": "sem_numero_ou_texto"}), 200
 
-    numero_bruto = remote_jid.split("@")[0] or str(dados.get("telefone") or "")
-    numero_norm = normalizar_telefone(numero_bruto)
-    numero_envio = formatar_para_envio(numero_bruto)
-    from_me = bool(key.get("fromMe", dados.get("fromMe", False)))
-
-    texto = (
-        msg_obj.get("conversation")
-        or (msg_obj.get("extendedTextMessage") or {}).get("text")
-        or dados.get("mensagem")
-        or dados.get("body")
-        or ""
-    )
-    texto = str(texto).strip()
-
-    if not numero_norm or not texto:
-        return jsonify({"status": "ignorado"}), 200
-
+    # Alunos novos entram livremente; apenas números bloqueados são ignorados
     bloqueados = carregar_numeros_bloqueados()
     if numero_norm in bloqueados:
         return jsonify({"status": "bloqueado"}), 200
 
     if from_me:
         if eh_mensagem_encerramento(texto):
-            gerenciar_estado_humano(numero_norm, acao="desativar")
+            gerenciar_estado_humano(numero_norm, acao="desativar", nome_aluno=nome_push)
             return jsonify({"status": "reativado_por_encerramento"}), 200
         if not dados.get("enviado_pelo_bot", False):
-            gerenciar_estado_humano(numero_norm, acao="ativar")
+            gerenciar_estado_humano(numero_norm, acao="ativar", nome_aluno=nome_push)
             return jsonify({"status": "pausado_por_humano"}), 200
         return jsonify({"status": "mensagem_bot"}), 200
 
-    if gerenciar_estado_humano(numero_norm, acao="verificar") and not eh_mensagem_encerramento(texto):
+    if gerenciar_estado_humano(numero_norm, acao="verificar", nome_aluno=nome_push) and not eh_mensagem_encerramento(texto):
         return jsonify({"status": "robô_pausado"}), 200
 
     resposta = consultar_excel(texto, numero_norm)
     enviar_mensagem_whatsapp(numero_envio, resposta)
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"status": "ok", "numero": numero_norm}), 200
 
 
 if __name__ == "__main__":
