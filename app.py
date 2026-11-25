@@ -1,5 +1,6 @@
 import io
 import os
+import time
 from datetime import datetime, timedelta, timezone
 
 from flask import (
@@ -40,6 +41,7 @@ MENSAGEM_ENCERRAMENTO = (
 )
 
 pausa_memoria = set()
+mensagens_recentes_bot = {}
 
 
 # ==============================================================================
@@ -69,14 +71,42 @@ def agora_brasil():
 
 
 def converter_numero_seguro(valor):
-    """Evita 'could not convert string to float' quando recebe texto livre."""
+    """Evita 'could not convert string to float' em textos livres, NaN ou vazios."""
     if valor is None:
         return None
+    try:
+        if pd.isna(valor):
+            return None
+    except Exception:
+        pass
     texto = str(valor).strip().replace(",", ".")
+    if not texto:
+        return None
     try:
         return float(texto)
     except (ValueError, TypeError):
         return None
+
+
+def obter_coluna(row, candidatos, padrao=""):
+    """Busca o valor de uma coluna aceitando variações de nome e espaços extras."""
+    for nome in candidatos:
+        if nome in row.index:
+            val = row.get(nome)
+            if val is not None and not (isinstance(val, float) and pd.isna(val)):
+                s = str(val).strip()
+                if s and s.lower() != "nan":
+                    return s
+    for col in row.index:
+        col_limpa = str(col).strip().lower()
+        for cand in candidatos:
+            if col_limpa == str(cand).strip().lower():
+                val = row.get(col)
+                if val is not None and not (isinstance(val, float) and pd.isna(val)):
+                    s = str(val).strip()
+                    if s and s.lower() != "nan":
+                        return s
+    return padrao
 
 
 def eh_mensagem_encerramento(texto):
@@ -89,6 +119,25 @@ def eh_mensagem_encerramento(texto):
         or limpo.strip() == "#finalizar"
         or "atendimento encerrado. obrigado pelo contato!" in limpo
     )
+
+
+def registrar_envio_bot(numero_norm, texto):
+    agora = time.time()
+    expirados = [k for k, ts in mensagens_recentes_bot.items() if agora - ts > 60]
+    for k in expirados:
+        mensagens_recentes_bot.pop(k, None)
+    trecho = " ".join(str(texto or "").lower().split())[:120]
+    mensagens_recentes_bot[(numero_norm, trecho)] = agora
+
+
+def foi_enviado_recentemente_pelo_bot(numero_norm, texto):
+    agora = time.time()
+    trecho = " ".join(str(texto or "").lower().split())[:120]
+    for (num, txt_bot), ts in mensagens_recentes_bot.items():
+        if num == numero_norm and (agora - ts) <= 60:
+            if trecho and (trecho in txt_bot or txt_bot in trecho):
+                return True
+    return False
 
 
 def chave_autenticada(req):
@@ -109,10 +158,6 @@ def chave_autenticada(req):
 
 
 def configurar_webhook_automatico():
-    """
-    Configura automaticamente o Webhook na Evolution API para a instância oficial,
-    garantindo que MESSAGES_UPSERT e SEND_MESSAGE estejam ativos.
-    """
     headers = {"Content-Type": "application/json", "apikey": EVOLUTION_API_KEY}
     payload_v2 = {
         "webhook": {
@@ -153,7 +198,6 @@ def configurar_webhook_automatico():
 
 
 def buscar_contatos_whatsapp():
-    """Consulta a Evolution API para listar contatos e chats sincronizados."""
     contatos_unicos = {}
     headers = {"Content-Type": "application/json", "apikey": EVOLUTION_API_KEY}
 
@@ -207,7 +251,6 @@ def buscar_contatos_whatsapp():
 
 
 def listar_atendimentos_pausados():
-    """Retorna a lista de números que estão atualmente em atendimento humano."""
     pausados = set(pausa_memoria)
     try:
         if os.path.exists(EXCEL_FILE):
@@ -230,7 +273,8 @@ def carregar_numeros_bloqueados():
         if not os.path.exists(EXCEL_FILE):
             return []
         df_bloq = pd.read_excel(EXCEL_FILE, sheet_name="TelefoneContatos_Bloqueados")
-        return [normalizar_telefone(num) for num in df_bloq["Telefone"].dropna().tolist()]
+        col_tel = "Telefone" if "Telefone" in df_bloq.columns else df_bloq.columns[0]
+        return [normalizar_telefone(num) for num in df_bloq[col_tel].dropna().tolist()]
     except Exception as e:
         print(f"[ERRO] Falha ao carregar bloqueados: {e}")
         return []
@@ -382,9 +426,13 @@ def gerar_texto_menu_principal():
         "Escolha uma das opções abaixo digitando apenas o *número* correspondente:\n\n"
     )
     for _, row in df_menu.iterrows():
-        num_val = converter_numero_seguro(row.get("Numero"))
-        num_fmt = int(num_val) if num_val is not None else row.get("Numero")
-        menu_texto += f"• *{num_fmt}* — {row.get('Opcao', '')}\n"
+        num_val = converter_numero_seguro(
+            obter_coluna(row, ["Numero", "Número", "Numero_Menu", "Opcao_Numero"], "")
+        )
+        num_fmt = int(num_val) if num_val is not None else ""
+        opcao_txt = obter_coluna(row, ["Opcao", "Opção", "Descricao", "Descrição"], "")
+        if num_fmt != "" or opcao_txt:
+            menu_texto += f"• *{num_fmt}* — {opcao_txt}\n"
     menu_texto += (
         "\n-----------------------------------\n"
         "💡 *Como continuar:*\n"
@@ -395,17 +443,19 @@ def gerar_texto_menu_principal():
 
 
 def formatar_resposta(row):
-    cat = row.get("Categoria ", "")
-    proc = row.get("Processo ", "")
-    resp = row.get("Instrucoes_Tecnicas", "Consulte os detalhes no portal.")
-    link_arquivo = row.get("Link_Arquivo", "")
+    cat = obter_coluna(row, ["Categoria ", "Categoria", "Categoria_Menu"], "Atendimento")
+    proc = obter_coluna(row, ["Processo ", "Processo", "Submenu", "Topico"], "Informação")
+    resp = obter_coluna(
+        row,
+        ["Instrucoes_Tecnicas", "Instruções_Técnicas", "Resposta", "Instrucoes"],
+        "Consulte os detalhes no portal.",
+    )
+    link_arquivo = obter_coluna(row, ["Link_Arquivo", "Link", "Arquivo"], "")
 
     texto_final = f"📌 *{cat} — {proc}*\n\n{resp}"
 
-    if pd.notna(link_arquivo) and str(link_arquivo).strip() != "":
-        texto_final += (
-            f"\n\n📂 *Material / Documento Associado:*\n{str(link_arquivo).strip()}"
-        )
+    if link_arquivo:
+        texto_final += f"\n\n📂 *Material / Documento Associado:*\n{link_arquivo}"
 
     texto_final += (
         "\n\n-----------------------------------\n"
@@ -417,7 +467,7 @@ def formatar_resposta(row):
 
 
 # ==============================================================================
-# 3. MOTOR DE CONSULTA AO EXCEL
+# 3. MOTOR DE CONSULTA AO EXCEL (MENU + SUBMENU BLINDADO)
 # ==============================================================================
 
 def consultar_excel(pergunta, numero_aluno_norm):
@@ -451,6 +501,7 @@ def consultar_excel(pergunta, numero_aluno_norm):
             "ajuda",
         ]
         if pergunta_limpa in comandos_menu:
+            gerenciar_estado_humano(numero_aluno_norm, acao="desativar")
             registrar_metrica(
                 numero_aluno_norm,
                 "Menu Principal",
@@ -463,6 +514,17 @@ def consultar_excel(pergunta, numero_aluno_norm):
 
         df_faq = pd.read_excel(EXCEL_FILE, sheet_name="FAQ_BaseNumero_Menu")
 
+        # Cria coluna auxiliar numérica segura para o menu principal
+        menus_numericos = []
+        for _, r in df_faq.iterrows():
+            val_m = converter_numero_seguro(
+                obter_coluna(r, ["Numero_Menu", "Numero", "Menu", "Opcao"], "")
+            )
+            menus_numericos.append(val_m)
+        df_faq = df_faq.copy()
+        df_faq["_menu_num"] = menus_numericos
+
+        # 1) Escolha de opção numérica única (ex.: 1, 2, 3, 4, 5, 6)
         if pergunta_limpa.isdigit() and len(pergunta_limpa) == 1:
             num_opcao = converter_numero_seguro(pergunta_limpa)
 
@@ -476,14 +538,13 @@ def consultar_excel(pergunta, numero_aluno_norm):
                     "Transferido para Atendente",
                     "Em andamento",
                 )
-                filtrado_5 = df_faq[df_faq["Numero_Menu"] == 5.0]
+                filtrado_5 = df_faq[df_faq["_menu_num"] == 5.0]
                 msg_humano = "👩‍💻 *Transferindo para o Atendimento Humano...*\n\n"
                 if not filtrado_5.empty:
-                    msg_humano += str(
-                        filtrado_5.iloc[0].get(
-                            "Instrucoes_Tecnicas",
-                            "Aguarde um momento, um de nossos atendentes já vai falar com você.",
-                        )
+                    msg_humano += obter_coluna(
+                        filtrado_5.iloc[0],
+                        ["Instrucoes_Tecnicas", "Instruções_Técnicas", "Resposta"],
+                        "Aguarde um momento, um de nossos atendentes já vai falar com você.",
                     )
                 else:
                     msg_humano += (
@@ -493,22 +554,24 @@ def consultar_excel(pergunta, numero_aluno_norm):
                 msg_humano += "\n\n_(O robô ficará pausado durante este atendimento)_"
                 return msg_humano
 
-            filtrado = df_faq[df_faq["Numero_Menu"] == num_opcao]
+            filtrado = df_faq[df_faq["_menu_num"] == num_opcao]
 
             if not filtrado.empty:
                 if len(filtrado) == 1:
                     row_unica = filtrado.iloc[0]
                     registrar_metrica(
                         numero_aluno_norm,
-                        row_unica.get("Categoria ", ""),
-                        row_unica.get("Processo ", ""),
+                        obter_coluna(row_unica, ["Categoria ", "Categoria"], ""),
+                        obter_coluna(row_unica, ["Processo ", "Processo"], ""),
                         pergunta,
                         "Resposta Direta",
                         "Sim",
                     )
                     return formatar_resposta(row_unica)
 
-                cat_nome = filtrado.iloc[0].get("Categoria ", "Atendimento")
+                cat_nome = obter_coluna(
+                    filtrado.iloc[0], ["Categoria ", "Categoria"], "Atendimento"
+                )
                 registrar_metrica(
                     numero_aluno_norm,
                     cat_nome,
@@ -522,11 +585,27 @@ def consultar_excel(pergunta, numero_aluno_norm):
                     f"Digite o número da opção desejada (exemplo: *{int(num_opcao)}.1*):\n\n"
                 )
 
+                contador_sub = 1
                 for _, row in filtrado.iterrows():
-                    sub_val = converter_numero_seguro(row.get("Numero_Submenu", 1))
-                    sub_num = int(sub_val) if sub_val is not None else 1
-                    proc = row.get("Processo ", "")
-                    sub_texto += f"• *{int(num_opcao)}.{sub_num}* — {proc}\n"
+                    sub_raw = obter_coluna(
+                        row, ["Numero_Submenu", "Submenu", "Numero_Sub", "Item"], ""
+                    )
+                    sub_val = converter_numero_seguro(sub_raw)
+                    if sub_val is not None and sub_val > 0:
+                        # Se vier como 1.1 no Excel, pega o decimal; se vier 1, usa 1
+                        texto_sub = str(sub_raw).replace(",", ".")
+                        if "." in texto_sub and not texto_sub.endswith(".0"):
+                            sub_fmt = texto_sub
+                        else:
+                            sub_fmt = f"{int(num_opcao)}.{int(sub_val)}"
+                    else:
+                        sub_fmt = f"{int(num_opcao)}.{contador_sub}"
+                    contador_sub += 1
+
+                    proc = obter_coluna(
+                        row, ["Processo ", "Processo", "Submenu_Titulo", "Topico"], ""
+                    )
+                    sub_texto += f"• *{sub_fmt}* — {proc}\n"
 
                 sub_texto += (
                     "\n-----------------------------------\n"
@@ -536,44 +615,50 @@ def consultar_excel(pergunta, numero_aluno_norm):
                 )
                 return sub_texto
 
-        if "." in pergunta_limpa:
-            partes = pergunta_limpa.split(".")
+        # 2) Escolha de submenu (ex.: 1.1 ou 2.3)
+        if "." in pergunta_limpa or "," in pergunta_limpa:
+            texto_sub_limpo = pergunta_limpa.replace(",", ".")
+            partes = texto_sub_limpo.split(".")
             menu_num = converter_numero_seguro(partes[0])
             sub_num = converter_numero_seguro(partes[-1])
             if menu_num is not None and sub_num is not None:
                 if menu_num == 5.0:
                     gerenciar_estado_humano(numero_aluno_norm, acao="ativar")
 
-                encontrado = df_faq[
-                    (df_faq["Numero_Menu"] == menu_num)
-                    & (df_faq["Numero_Submenu"] == sub_num)
-                ]
-                if not encontrado.empty:
-                    row = encontrado.iloc[0]
-                    registrar_metrica(
-                        numero_aluno_norm,
-                        row.get("Categoria ", ""),
-                        row.get("Processo ", ""),
-                        pergunta,
-                        "Resposta Submenu",
-                        "Sim",
+                for idx, row in df_faq[df_faq["_menu_num"] == menu_num].iterrows():
+                    sub_raw = obter_coluna(
+                        row, ["Numero_Submenu", "Submenu", "Numero_Sub", "Item"], ""
                     )
-                    return formatar_resposta(row)
+                    sub_val = converter_numero_seguro(sub_raw)
+                    # Aceita correspondência direta (ex.: sub_num == 1 ou sub_num == 1.1)
+                    if sub_val == sub_num or str(sub_raw).replace(",", ".").strip() == texto_sub_limpo:
+                        registrar_metrica(
+                            numero_aluno_norm,
+                            obter_coluna(row, ["Categoria ", "Categoria"], ""),
+                            obter_coluna(row, ["Processo ", "Processo"], ""),
+                            pergunta,
+                            "Resposta Submenu",
+                            "Sim",
+                        )
+                        return formatar_resposta(row)
 
+        # 3) Busca por palavra-chave / processo / categoria
+        palavras_pergunta = [p for p in pergunta_limpa.split() if len(p) >= 3]
         for _, row in df_faq.iterrows():
-            categoria = str(row.get("Categoria ", "")).lower()
-            processo = str(row.get("Processo ", "")).lower()
-            palavras_chave = str(row.get("Palavras_Chave", "")).lower()
+            categoria = obter_coluna(row, ["Categoria ", "Categoria"], "").lower()
+            processo = obter_coluna(row, ["Processo ", "Processo"], "").lower()
+            palavras_chave = obter_coluna(
+                row, ["Palavras_Chave", "Palavras", "Keywords"], ""
+            ).lower()
+            base_busca = f"{categoria} {processo} {palavras_chave}"
 
-            if (
-                (pergunta_limpa in palavras_chave)
-                or (pergunta_limpa in processo)
-                or (pergunta_limpa in categoria)
+            if pergunta_limpa in base_busca or any(
+                p in base_busca for p in palavras_pergunta
             ):
                 registrar_metrica(
                     numero_aluno_norm,
-                    row.get("Categoria ", ""),
-                    row.get("Processo ", ""),
+                    obter_coluna(row, ["Categoria ", "Categoria"], ""),
+                    obter_coluna(row, ["Processo ", "Processo"], ""),
                     pergunta,
                     "Busca Palavra-Chave",
                     "Sim",
@@ -594,7 +679,8 @@ def consultar_excel(pergunta, numero_aluno_norm):
             "• Digite *0* para encerrar o atendimento"
         )
 
-    except Exception:
+    except Exception as e:
+        print(f"[ERRO CONSULTAR_EXCEL] {e}")
         return (
             "Desculpe, não encontrei essa opção no diretório acadêmico. 🤔\n\n"
             "• Digite *menu* para ver as opções disponíveis\n"
@@ -618,6 +704,7 @@ def enviar_mensagem_whatsapp(numero_destino, texto_resposta):
     }
 
     try:
+        registrar_envio_bot(normalizar_telefone(numero_destino), texto_resposta)
         response = requests.post(url, json=payload, headers=headers, timeout=10)
         print(
             f"[ENVIO API] Status: {response.status_code} | Destino: {numero_destino} | Resp: {response.text}"
@@ -987,7 +1074,6 @@ def webhook():
     if not numero_norm or not numero_envio or not texto:
         return jsonify({"status": "ignorado", "motivo": "sem_numero_ou_texto"}), 200
 
-    # Alunos novos entram livremente; apenas números bloqueados são ignorados
     bloqueados = carregar_numeros_bloqueados()
     if numero_norm in bloqueados:
         return jsonify({"status": "bloqueado"}), 200
@@ -996,6 +1082,8 @@ def webhook():
         if eh_mensagem_encerramento(texto):
             gerenciar_estado_humano(numero_norm, acao="desativar", nome_aluno=nome_push)
             return jsonify({"status": "reativado_por_encerramento"}), 200
+        if foi_enviado_recentemente_pelo_bot(numero_norm, texto):
+            return jsonify({"status": "mensagem_bot"}), 200
         if not dados.get("enviado_pelo_bot", False):
             gerenciar_estado_humano(numero_norm, acao="ativar", nome_aluno=nome_push)
             return jsonify({"status": "pausado_por_humano"}), 200
