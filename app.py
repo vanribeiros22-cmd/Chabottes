@@ -1,5 +1,7 @@
 import io
+import json
 import os
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -32,7 +34,9 @@ WEBHOOK_PUBLIC_URL = os.environ.get(
     "WEBHOOK_PUBLIC_URL", "https://chattest-production-37ef5795.up.railway.app/webhook"
 ).strip()
 
-EXCEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diretorio_academico.xlsx")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+EXCEL_FILE = os.path.join(BASE_DIR, "diretorio_academico.xlsx")
+METRICS_LOG_FILE = os.path.join(BASE_DIR, "metricas_atendimentos_log.jsonl")
 FUSO_BR = timezone(timedelta(hours=-3))
 
 MENSAGEM_ENCERRAMENTO = (
@@ -40,6 +44,7 @@ MENSAGEM_ENCERRAMENTO = (
     "Se precisar de algo, é só enviar uma nova mensagem a qualquer momento"
 )
 
+excel_lock = threading.Lock()
 pausa_memoria = set()
 mensagens_recentes_bot = {}
 
@@ -253,16 +258,17 @@ def buscar_contatos_whatsapp():
 def listar_atendimentos_pausados():
     pausados = set(pausa_memoria)
     try:
-        if os.path.exists(EXCEL_FILE):
-            xls = pd.ExcelFile(EXCEL_FILE)
-            if "Controle_Alunos" in xls.sheet_names:
-                df_controle = pd.read_excel(EXCEL_FILE, sheet_name="Controle_Alunos")
-                if not df_controle.empty and "Humano" in df_controle.columns:
-                    ativos = df_controle[
-                        df_controle["Humano"].astype(str).str.upper() == "SIM"
-                    ]
-                    for num in ativos["ID_Usuario"].dropna().tolist():
-                        pausados.add(str(num))
+        with excel_lock:
+            if os.path.exists(EXCEL_FILE):
+                xls = pd.ExcelFile(EXCEL_FILE)
+                if "Controle_Alunos" in xls.sheet_names:
+                    df_controle = pd.read_excel(EXCEL_FILE, sheet_name="Controle_Alunos")
+                    if not df_controle.empty and "Humano" in df_controle.columns:
+                        ativos = df_controle[
+                            df_controle["Humano"].astype(str).str.upper() == "SIM"
+                        ]
+                        for num in ativos["ID_Usuario"].dropna().tolist():
+                            pausados.add(str(num))
     except Exception as e:
         print(f"[AVISO] Erro ao listar pausados: {e}")
     return sorted(list(pausados))
@@ -270,11 +276,12 @@ def listar_atendimentos_pausados():
 
 def carregar_numeros_bloqueados():
     try:
-        if not os.path.exists(EXCEL_FILE):
-            return []
-        df_bloq = pd.read_excel(EXCEL_FILE, sheet_name="TelefoneContatos_Bloqueados")
-        col_tel = "Telefone" if "Telefone" in df_bloq.columns else df_bloq.columns[0]
-        return [normalizar_telefone(num) for num in df_bloq[col_tel].dropna().tolist()]
+        with excel_lock:
+            if not os.path.exists(EXCEL_FILE):
+                return []
+            df_bloq = pd.read_excel(EXCEL_FILE, sheet_name="TelefoneContatos_Bloqueados")
+            col_tel = "Telefone" if "Telefone" in df_bloq.columns else df_bloq.columns[0]
+            return [normalizar_telefone(num) for num in df_bloq[col_tel].dropna().tolist()]
     except Exception as e:
         print(f"[ERRO] Falha ao carregar bloqueados: {e}")
         return []
@@ -288,139 +295,216 @@ def gerenciar_estado_humano(numero_norm, acao="verificar", nome_aluno="Aluno Wha
         return True
 
     try:
-        if not os.path.exists(EXCEL_FILE):
-            return numero_norm in pausa_memoria
+        with excel_lock:
+            if not os.path.exists(EXCEL_FILE):
+                return numero_norm in pausa_memoria
 
-        todas_abas = pd.read_excel(EXCEL_FILE, sheet_name=None)
-        df_controle = todas_abas.get(
-            "Controle_Alunos",
-            pd.DataFrame(
-                columns=[
-                    "ID_Usuario",
-                    "Nome_Aluno",
-                    "Status",
-                    "Ultima_Interacao",
-                    "Etapa",
-                    "Humano",
-                ]
-            ),
-        )
-        df_controle["ID_Usuario"] = df_controle["ID_Usuario"].astype(str)
-
-        if acao == "verificar":
-            reg = df_controle[df_controle["ID_Usuario"] == numero_norm]
-            if not reg.empty:
-                esta_humano = str(reg.iloc[-1]["Humano"]).strip().upper() == "SIM"
-                if esta_humano:
-                    pausa_memoria.add(numero_norm)
-                return esta_humano
-            return False
-
-        elif acao in ["ativar", "desativar"]:
-            if acao == "ativar":
-                pausa_memoria.add(numero_norm)
-            else:
-                pausa_memoria.discard(numero_norm)
-
-            status_humano = "SIM" if acao == "ativar" else "NAO"
-            etapa_atual = "Atendimento Humano" if acao == "ativar" else "Finalizado"
-
-            if numero_norm in df_controle["ID_Usuario"].values:
-                df_controle.loc[
-                    df_controle["ID_Usuario"] == numero_norm, "Humano"
-                ] = status_humano
-                df_controle.loc[
-                    df_controle["ID_Usuario"] == numero_norm, "Ultima_Interacao"
-                ] = agora_brasil()
-                df_controle.loc[
-                    df_controle["ID_Usuario"] == numero_norm, "Etapa"
-                ] = etapa_atual
-            else:
-                nova_linha = pd.DataFrame(
-                    [
-                        {
-                            "ID_Usuario": numero_norm,
-                            "Nome_Aluno": nome_aluno or "Aluno WhatsApp",
-                            "Status": "Ativo",
-                            "Ultima_Interacao": agora_brasil(),
-                            "Etapa": etapa_atual,
-                            "Humano": status_humano,
-                        }
+            todas_abas = pd.read_excel(EXCEL_FILE, sheet_name=None)
+            df_controle = todas_abas.get(
+                "Controle_Alunos",
+                pd.DataFrame(
+                    columns=[
+                        "ID_Usuario",
+                        "Nome_Aluno",
+                        "Status",
+                        "Ultima_Interacao",
+                        "Etapa",
+                        "Humano",
                     ]
-                )
-                df_controle = pd.concat([df_controle, nova_linha], ignore_index=True)
+                ),
+            )
+            df_controle["ID_Usuario"] = df_controle["ID_Usuario"].astype(str)
 
-            todas_abas["Controle_Alunos"] = df_controle
-            with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl") as writer:
-                for nome_aba, df_aba in todas_abas.items():
-                    df_aba.to_excel(writer, sheet_name=nome_aba, index=False)
-            return True
+            if acao == "verificar":
+                reg = df_controle[df_controle["ID_Usuario"] == numero_norm]
+                if not reg.empty:
+                    esta_humano = str(reg.iloc[-1]["Humano"]).strip().upper() == "SIM"
+                    if esta_humano:
+                        pausa_memoria.add(numero_norm)
+                    return esta_humano
+                return False
+
+            elif acao in ["ativar", "desativar"]:
+                if acao == "ativar":
+                    pausa_memoria.add(numero_norm)
+                else:
+                    pausa_memoria.discard(numero_norm)
+
+                status_humano = "SIM" if acao == "ativar" else "NAO"
+                etapa_atual = "Atendimento Humano" if acao == "ativar" else "Finalizado"
+
+                if numero_norm in df_controle["ID_Usuario"].values:
+                    df_controle.loc[
+                        df_controle["ID_Usuario"] == numero_norm, "Humano"
+                    ] = status_humano
+                    df_controle.loc[
+                        df_controle["ID_Usuario"] == numero_norm, "Ultima_Interacao"
+                    ] = agora_brasil()
+                    df_controle.loc[
+                        df_controle["ID_Usuario"] == numero_norm, "Etapa"
+                    ] = etapa_atual
+                else:
+                    nova_linha = pd.DataFrame(
+                        [
+                            {
+                                "ID_Usuario": numero_norm,
+                                "Nome_Aluno": nome_aluno or "Aluno WhatsApp",
+                                "Status": "Ativo",
+                                "Ultima_Interacao": agora_brasil(),
+                                "Etapa": etapa_atual,
+                                "Humano": status_humano,
+                            }
+                        ]
+                    )
+                    df_controle = pd.concat([df_controle, nova_linha], ignore_index=True)
+
+                todas_abas["Controle_Alunos"] = df_controle
+                with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl") as writer:
+                    for nome_aba, df_aba in todas_abas.items():
+                        df_aba.to_excel(writer, sheet_name=nome_aba, index=False)
+                return True
 
     except Exception as e:
         print(f"[ERRO] Falha ao gravar estado humano no Excel: {e}")
         return numero_norm in pausa_memoria
 
 
+def _construir_registro_metrica(
+    id_log, numero_aluno, categoria, processo, duvida, desfecho, resolvido="Sim"
+):
+    return {
+        "ID_Log": id_log,
+        "Data_Hora": agora_brasil(),
+        "ID_Usuario": str(numero_aluno or ""),
+        "Canal": "WhatsApp",
+        "Categoria": str(categoria or ""),
+        "Processo": str(processo or ""),
+        "Duvida_Aluno": str(duvida or ""),
+        "Desfecho": str(desfecho or ""),
+        "Resolvido": str(resolvido or "Sim"),
+    }
+
+
+def ler_metricas_log():
+    registros = []
+    if not os.path.exists(METRICS_LOG_FILE):
+        return registros
+    try:
+        with open(METRICS_LOG_FILE, "r", encoding="utf-8") as f:
+            for linha in f:
+                linha = linha.strip()
+                if linha:
+                    registros.append(json.loads(linha))
+    except Exception as e:
+        print(f"[AVISO] Erro ao ler log de métricas: {e}")
+    return registros
+
+
 def registrar_metrica(
     numero_aluno, categoria, processo, duvida, desfecho, resolvido="Sim"
 ):
-    try:
-        if not os.path.exists(EXCEL_FILE):
-            return
+    """Salva métrica em log persistente (.jsonl) + tenta gravar na aba Metricas_Atendimentos do Excel."""
+    with excel_lock:
+        try:
+            log_existente = ler_metricas_log()
+            base_id = len(log_existente) + 1
+            if os.path.exists(EXCEL_FILE):
+                try:
+                    todas_abas = pd.read_excel(EXCEL_FILE, sheet_name=None)
+                    nome_aba_metricas = (
+                        "Metricas_Atendimentos "
+                        if "Metricas_Atendimentos " in todas_abas
+                        else "Metricas_Atendimentos"
+                    )
+                    df_met = todas_abas.get(nome_aba_metricas)
+                    if df_met is not None and not df_met.empty:
+                        base_id = max(base_id, len(df_met) + 1)
+                except Exception:
+                    pass
 
-        todas_abas = pd.read_excel(EXCEL_FILE, sheet_name=None)
-        nome_aba_metricas = (
-            "Metricas_Atendimentos "
-            if "Metricas_Atendimentos " in todas_abas
-            else "Metricas_Atendimentos"
-        )
+            registro = _construir_registro_metrica(
+                base_id, numero_aluno, categoria, processo, duvida, desfecho, resolvido
+            )
 
-        df_met = todas_abas.get(
-            nome_aba_metricas,
-            pd.DataFrame(
-                columns=[
-                    "ID_Log",
-                    "Data_Hora",
-                    "ID_Usuario",
-                    "Canal",
-                    "Categoria",
-                    "Processo",
-                    "Duvida_Aluno",
-                    "Desfecho",
-                    "Resolvido",
-                ]
-            ),
-        )
+            # 1) Grava sempre no arquivo de log seguro
+            with open(METRICS_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(registro, ensure_ascii=False) + "\n")
 
-        novo_id = len(df_met) + 1
-        nova_linha = pd.DataFrame(
-            [
-                {
-                    "ID_Log": novo_id,
-                    "Data_Hora": agora_brasil(),
-                    "ID_Usuario": numero_aluno,
-                    "Canal": "WhatsApp",
-                    "Categoria": categoria,
-                    "Processo": processo,
-                    "Duvida_Aluno": duvida,
-                    "Desfecho": desfecho,
-                    "Resolvido": resolvido,
-                }
-            ]
-        )
+            # 2) Atualiza também a planilha Excel quando disponível
+            if os.path.exists(EXCEL_FILE):
+                try:
+                    todas_abas = pd.read_excel(EXCEL_FILE, sheet_name=None)
+                    nome_aba_metricas = (
+                        "Metricas_Atendimentos "
+                        if "Metricas_Atendimentos " in todas_abas
+                        else "Metricas_Atendimentos"
+                    )
+                    df_met = todas_abas.get(
+                        nome_aba_metricas,
+                        pd.DataFrame(
+                            columns=[
+                                "ID_Log",
+                                "Data_Hora",
+                                "ID_Usuario",
+                                "Canal",
+                                "Categoria",
+                                "Processo",
+                                "Duvida_Aluno",
+                                "Desfecho",
+                                "Resolvido",
+                            ]
+                        ),
+                    )
+                    todas_abas[nome_aba_metricas] = pd.concat(
+                        [df_met, pd.DataFrame([registro])], ignore_index=True
+                    )
+                    with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl") as writer:
+                        for nome_aba, df_aba in todas_abas.items():
+                            df_aba.to_excel(writer, sheet_name=nome_aba, index=False)
+                except Exception as e_xl:
+                    print(f"[AVISO] Falha ao atualizar aba Excel (salvo no log): {e_xl}")
 
-        todas_abas[nome_aba_metricas] = pd.concat([df_met, nova_linha], ignore_index=True)
+        except Exception as e:
+            print(f"[ERRO] Falha ao registrar métrica: {e}")
 
-        with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl") as writer:
-            for nome_aba, df_aba in todas_abas.items():
-                df_aba.to_excel(writer, sheet_name=nome_aba, index=False)
 
-    except Exception as e:
-        print(f"[ERRO] Falha ao registrar métrica: {e}")
+def obter_resumo_metricas():
+    registros = ler_metricas_log()
+    if not registros and os.path.exists(EXCEL_FILE):
+        try:
+            with excel_lock:
+                todas_abas = pd.read_excel(EXCEL_FILE, sheet_name=None)
+                nome_aba = (
+                    "Metricas_Atendimentos "
+                    if "Metricas_Atendimentos " in todas_abas
+                    else "Metricas_Atendimentos"
+                )
+                if nome_aba in todas_abas:
+                    registros = todas_abas[nome_aba].to_dict(orient="records")
+        except Exception:
+            pass
+
+    total = len(registros)
+    resolvidos = sum(
+        1 for r in registros if str(r.get("Resolvido", "")).strip().lower() == "sim"
+    )
+    humanos = sum(
+        1 for r in registros if "humano" in str(r.get("Categoria", "")).lower()
+    )
+    fallbacks = sum(
+        1 for r in registros if str(r.get("Categoria", "")).strip().lower() == "não identificado"
+    )
+    return {
+        "total": total,
+        "resolvidos": resolvidos,
+        "humanos": humanos,
+        "fallbacks": fallbacks,
+    }
 
 
 def gerar_texto_menu_principal():
-    df_menu = pd.read_excel(EXCEL_FILE, sheet_name="Menu_Principal")
+    with excel_lock:
+        df_menu = pd.read_excel(EXCEL_FILE, sheet_name="Menu_Principal")
     menu_texto = (
         "👋 Bem-vinda(o) ao atendimento acadêmico da Sofia!\n\n"
         "Escolha uma das opções abaixo digitando apenas o *número* correspondente:\n\n"
@@ -467,7 +551,7 @@ def formatar_resposta(row):
 
 
 # ==============================================================================
-# 3. MOTOR DE CONSULTA AO EXCEL (MENU + SUBMENU BLINDADO)
+# 3. MOTOR DE CONSULTA AO EXCEL (MENU + SUBMENU + PALAVRA-CHAVE SEGURA)
 # ==============================================================================
 
 def consultar_excel(pergunta, numero_aluno_norm):
@@ -512,9 +596,9 @@ def consultar_excel(pergunta, numero_aluno_norm):
             )
             return gerar_texto_menu_principal()
 
-        df_faq = pd.read_excel(EXCEL_FILE, sheet_name="FAQ_BaseNumero_Menu")
+        with excel_lock:
+            df_faq = pd.read_excel(EXCEL_FILE, sheet_name="FAQ_BaseNumero_Menu")
 
-        # Cria coluna auxiliar numérica segura para o menu principal
         menus_numericos = []
         for _, r in df_faq.iterrows():
             val_m = converter_numero_seguro(
@@ -524,7 +608,7 @@ def consultar_excel(pergunta, numero_aluno_norm):
         df_faq = df_faq.copy()
         df_faq["_menu_num"] = menus_numericos
 
-        # 1) Escolha de opção numérica única (ex.: 1, 2, 3, 4, 5, 6)
+        # 1) Opção numérica única (ex.: 1, 2, 3, 4, 5, 6)
         if pergunta_limpa.isdigit() and len(pergunta_limpa) == 1:
             num_opcao = converter_numero_seguro(pergunta_limpa)
 
@@ -592,7 +676,6 @@ def consultar_excel(pergunta, numero_aluno_norm):
                     )
                     sub_val = converter_numero_seguro(sub_raw)
                     if sub_val is not None and sub_val > 0:
-                        # Se vier como 1.1 no Excel, pega o decimal; se vier 1, usa 1
                         texto_sub = str(sub_raw).replace(",", ".")
                         if "." in texto_sub and not texto_sub.endswith(".0"):
                             sub_fmt = texto_sub
@@ -615,7 +698,7 @@ def consultar_excel(pergunta, numero_aluno_norm):
                 )
                 return sub_texto
 
-        # 2) Escolha de submenu (ex.: 1.1 ou 2.3)
+        # 2) Submenu (ex.: 1.1, 2.3)
         if "." in pergunta_limpa or "," in pergunta_limpa:
             texto_sub_limpo = pergunta_limpa.replace(",", ".")
             partes = texto_sub_limpo.split(".")
@@ -625,13 +708,15 @@ def consultar_excel(pergunta, numero_aluno_norm):
                 if menu_num == 5.0:
                     gerenciar_estado_humano(numero_aluno_norm, acao="ativar")
 
-                for idx, row in df_faq[df_faq["_menu_num"] == menu_num].iterrows():
+                for _, row in df_faq[df_faq["_menu_num"] == menu_num].iterrows():
                     sub_raw = obter_coluna(
                         row, ["Numero_Submenu", "Submenu", "Numero_Sub", "Item"], ""
                     )
                     sub_val = converter_numero_seguro(sub_raw)
-                    # Aceita correspondência direta (ex.: sub_num == 1 ou sub_num == 1.1)
-                    if sub_val == sub_num or str(sub_raw).replace(",", ".").strip() == texto_sub_limpo:
+                    if (
+                        sub_val == sub_num
+                        or str(sub_raw).replace(",", ".").strip() == texto_sub_limpo
+                    ):
                         registrar_metrica(
                             numero_aluno_norm,
                             obter_coluna(row, ["Categoria ", "Categoria"], ""),
@@ -642,28 +727,29 @@ def consultar_excel(pergunta, numero_aluno_norm):
                         )
                         return formatar_resposta(row)
 
-        # 3) Busca por palavra-chave / processo / categoria
-        palavras_pergunta = [p for p in pergunta_limpa.split() if len(p) >= 3]
-        for _, row in df_faq.iterrows():
-            categoria = obter_coluna(row, ["Categoria ", "Categoria"], "").lower()
-            processo = obter_coluna(row, ["Processo ", "Processo"], "").lower()
-            palavras_chave = obter_coluna(
-                row, ["Palavras_Chave", "Palavras", "Keywords"], ""
-            ).lower()
-            base_busca = f"{categoria} {processo} {palavras_chave}"
+        # 3) Busca por palavra-chave (apenas termos com 4+ letras para evitar falso positivo)
+        palavras_pergunta = [
+            p.strip(".,!?") for p in pergunta_limpa.split() if len(p.strip(".,!?")) >= 4
+        ]
+        if palavras_pergunta:
+            for _, row in df_faq.iterrows():
+                categoria = obter_coluna(row, ["Categoria ", "Categoria"], "").lower()
+                processo = obter_coluna(row, ["Processo ", "Processo"], "").lower()
+                palavras_chave = obter_coluna(
+                    row, ["Palavras_Chave", "Palavras", "Keywords"], ""
+                ).lower()
+                base_busca = f"{categoria} {processo} {palavras_chave}"
 
-            if pergunta_limpa in base_busca or any(
-                p in base_busca for p in palavras_pergunta
-            ):
-                registrar_metrica(
-                    numero_aluno_norm,
-                    obter_coluna(row, ["Categoria ", "Categoria"], ""),
-                    obter_coluna(row, ["Processo ", "Processo"], ""),
-                    pergunta,
-                    "Busca Palavra-Chave",
-                    "Sim",
-                )
-                return formatar_resposta(row)
+                if any(p in base_busca for p in palavras_pergunta):
+                    registrar_metrica(
+                        numero_aluno_norm,
+                        obter_coluna(row, ["Categoria ", "Categoria"], ""),
+                        obter_coluna(row, ["Processo ", "Processo"], ""),
+                        pergunta,
+                        "Busca Palavra-Chave",
+                        "Sim",
+                    )
+                    return formatar_resposta(row)
 
         registrar_metrica(
             numero_aluno_norm,
@@ -681,6 +767,14 @@ def consultar_excel(pergunta, numero_aluno_norm):
 
     except Exception as e:
         print(f"[ERRO CONSULTAR_EXCEL] {e}")
+        registrar_metrica(
+            numero_aluno_norm,
+            "Não Identificado",
+            "Erro Consulta",
+            pergunta,
+            "Erro ao processar",
+            "Não",
+        )
         return (
             "Desculpe, não encontrei essa opção no diretório acadêmico. 🤔\n\n"
             "• Digite *menu* para ver as opções disponíveis\n"
@@ -860,6 +954,7 @@ def painel_central():
     contatos_lista = buscar_contatos_whatsapp()
     pausados_lista = listar_atendimentos_pausados()
     bloqueados_lista = carregar_numeros_bloqueados()
+    resumo_met = obter_resumo_metricas()
 
     status_conexao = "Desconhecido"
     try:
@@ -886,6 +981,11 @@ def painel_central():
             .header { background: #0f766e; color: white; padding: 20px 25px; border-radius: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 15px; }
             .header h1 { margin: 0; font-size: 22px; }
             .badge { background: rgba(255,255,255,0.2); padding: 6px 12px; border-radius: 20px; font-size: 13px; }
+            .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 15px; }
+            @media (max-width: 768px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+            .stat-box { background: white; padding: 14px; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.05); text-align: center; }
+            .stat-num { font-size: 22px; font-weight: bold; color: #0f766e; }
+            .stat-lbl { font-size: 12px; color: #64748b; margin-top: 4px; }
             .toolbar { display: flex; gap: 10px; flex-wrap: wrap; margin: 20px 0; }
             .btn { padding: 11px 18px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; text-decoration: none; font-size: 14px; display: inline-flex; align-items: center; gap: 6px; }
             .btn-primary { background: #0284c7; color: white; }
@@ -905,7 +1005,7 @@ def painel_central():
             .alerta.ok { background: #dcfce7; color: #166534; border: 1px solid #86efac; }
             .alerta.erro { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
             .lista-item { display: flex; justify-content: space-between; align-items: center; padding: 10px; border-bottom: 1px solid #f1f5f9; }
-            .senha-box { background: #fffbeb; border: 1px solid #fde68a; padding: 12px 18px; border-radius: 8px; margin-bottom: 15px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+            .senha-box { background: #fffbeb; border: 1px solid #fde68a; padding: 12px 18px; border-radius: 8px; margin-top: 15px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
             .senha-box input { max-width: 240px; margin-top: 0; }
         </style>
         <script>
@@ -947,7 +1047,26 @@ def painel_central():
                 <div class="badge">Status WhatsApp: <b>{{ status_conexao }}</b></div>
             </div>
 
-            <div class="senha-box" style="margin-top: 15px;">
+            <div class="stats">
+                <div class="stat-box">
+                    <div class="stat-num">{{ resumo.total }}</div>
+                    <div class="stat-lbl">Total de Atendimentos</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-num">{{ resumo.resolvidos }}</div>
+                    <div class="stat-lbl">Resolvidos pelo Bot</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-num">{{ resumo.humanos }}</div>
+                    <div class="stat-lbl">Transbordos Humanos</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-num">{{ resumo.fallbacks }}</div>
+                    <div class="stat-lbl">Não Identificados</div>
+                </div>
+            </div>
+
+            <div class="senha-box">
                 <label style="margin:0;">🔑 Chave de Acesso:</label>
                 <input type="text" id="senha_mestra" onkeyup="sincronizarSenha(this.value)" placeholder="Digite cetrus2026teste para liberar ações">
                 <small style="color:#92400e;">Salva automaticamente por 30 dias (sem precisar redigitar).</small>
@@ -1045,19 +1164,54 @@ def painel_central():
         total_contatos=len(contatos_lista),
         contatos=contatos_lista,
         pausados=pausados_lista,
+        resumo=resumo_met,
     )
 
 
 @app.route("/metricas", methods=["GET"])
 def baixar_metricas():
-    if not os.path.exists(EXCEL_FILE):
-        return jsonify({"erro": "Arquivo Excel não encontrado."}), 404
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        todas_abas = pd.read_excel(EXCEL_FILE, sheet_name=None)
-        for nome_aba, df_aba in todas_abas.items():
-            df_aba.to_excel(writer, sheet_name=nome_aba, index=False)
-    output.seek(0)
+    with excel_lock:
+        todas_abas = {}
+        if os.path.exists(EXCEL_FILE):
+            try:
+                todas_abas = pd.read_excel(EXCEL_FILE, sheet_name=None)
+            except Exception as e:
+                print(f"[AVISO] Erro ao ler Excel para exportar métricas: {e}")
+
+        registros_log = ler_metricas_log()
+        nome_aba_metricas = (
+            "Metricas_Atendimentos "
+            if "Metricas_Atendimentos " in todas_abas
+            else "Metricas_Atendimentos"
+        )
+
+        if registros_log:
+            df_consolidado = pd.DataFrame(registros_log)
+        elif nome_aba_metricas in todas_abas:
+            df_consolidado = todas_abas[nome_aba_metricas]
+        else:
+            df_consolidado = pd.DataFrame(
+                columns=[
+                    "ID_Log",
+                    "Data_Hora",
+                    "ID_Usuario",
+                    "Canal",
+                    "Categoria",
+                    "Processo",
+                    "Duvida_Aluno",
+                    "Desfecho",
+                    "Resolvido",
+                ]
+            )
+
+        todas_abas[nome_aba_metricas] = df_consolidado
+
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            for nome_aba, df_aba in todas_abas.items():
+                df_aba.to_excel(writer, sheet_name=nome_aba, index=False)
+        output.seek(0)
+
     return send_file(
         output,
         as_attachment=True,
@@ -1081,11 +1235,27 @@ def webhook():
     if from_me:
         if eh_mensagem_encerramento(texto):
             gerenciar_estado_humano(numero_norm, acao="desativar", nome_aluno=nome_push)
+            registrar_metrica(
+                numero_norm,
+                "Encerramento",
+                "Encerramento Humano",
+                texto,
+                "Robô Reativado",
+                "Sim",
+            )
             return jsonify({"status": "reativado_por_encerramento"}), 200
         if foi_enviado_recentemente_pelo_bot(numero_norm, texto):
             return jsonify({"status": "mensagem_bot"}), 200
         if not dados.get("enviado_pelo_bot", False):
             gerenciar_estado_humano(numero_norm, acao="ativar", nome_aluno=nome_push)
+            registrar_metrica(
+                numero_norm,
+                "Atendimento Humano",
+                "Intervenção Manual",
+                texto,
+                "Robô Pausado",
+                "Em andamento",
+            )
             return jsonify({"status": "pausado_por_humano"}), 200
         return jsonify({"status": "mensagem_bot"}), 200
 
